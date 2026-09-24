@@ -7,6 +7,7 @@
 
 #include "openvino/genai/lora_adapter.hpp"
 #include "continuous_batching/cache/cache_eviction.hpp"
+#include "continuous_batching/cache_store/cache_store_tier.hpp"
 #include "visual_language/inputs_embedder.hpp"
 
 namespace ov::genai {
@@ -20,6 +21,8 @@ protected:
     std::shared_ptr<ModelRunner> m_model_runner;
     std::optional<AdapterController> m_adapter_controller;
     std::shared_ptr<Sampler> m_sampler;
+    // Cache store tier (SchedulerConfig::cache_store); null when the store is disabled
+    std::unique_ptr<cache_store::CacheStoreTier> m_cache_store;
 
     // current requests to process
     std::vector<SequenceGroup::Ptr> m_requests;

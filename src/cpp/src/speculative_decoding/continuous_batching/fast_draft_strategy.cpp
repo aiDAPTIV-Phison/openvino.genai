@@ -78,6 +78,9 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(con
     ov::genai::SchedulerConfig main_scheduler_config_updated = main_scheduler_config,
                                draft_scheduler_config = is_draft_scheduler_undefined ? main_scheduler_config : draft_model_desc.scheduler_config;
 
+    // Only the main model uses the cache store, so the draft scheduler config never carries one
+    draft_scheduler_config.cache_store = {};
+
     if (is_draft_scheduler_undefined) {
         // split KV cache to 2 caches for main and draft models
         auto compute_total_hidden_size = [] (const std::shared_ptr<ov::Model>& model) -> size_t {

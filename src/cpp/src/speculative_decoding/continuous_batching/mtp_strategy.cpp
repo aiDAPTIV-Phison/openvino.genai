@@ -92,6 +92,9 @@ ContinuousBatchingPipeline::MtpDecodingImpl::MtpDecodingImpl(const ov::genai::Mo
         draft_scheduler_config.max_num_batched_tokens = main_scheduler_config.max_num_batched_tokens;
     }
 
+    // Only the main model uses the cache store, so the draft scheduler config never carries one
+    draft_scheduler_config.cache_store = {};
+
     m_main_pipeline = std::make_shared<ContinuousBatchingForMtpDecodingImpl>(main_model,
                                                                             inputs_embedder,
                                                                             main_model_tokenizer,

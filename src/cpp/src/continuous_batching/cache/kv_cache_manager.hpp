@@ -148,6 +148,18 @@ public:
         return m_value_precisions[decoder_layer_id];
     }
 
+    /// @return Key cache input shape of the layer; dimension 0 (number of blocks) is dynamic.
+    const ov::PartialShape& get_key_cache_shape(size_t decoder_layer_id) const {
+        OPENVINO_ASSERT(decoder_layer_id < m_key_shapes.size());
+        return m_key_shapes[decoder_layer_id];
+    }
+
+    /// @return Value cache input shape of the layer; dimension 0 (number of blocks) is dynamic.
+    const ov::PartialShape& get_value_cache_shape(size_t decoder_layer_id) const {
+        OPENVINO_ASSERT(decoder_layer_id < m_value_shapes.size());
+        return m_value_shapes[decoder_layer_id];
+    }
+
     // --- KV-cache-specific accessors ---
 
     size_t sub_byte_data_type_multiplier(const ov::element::Type data_type) const {

@@ -199,6 +199,38 @@ public:
         return m_num_allocated_blocks;
     }
 
+    /// Name, element type and input shape of one state table; dimension 0 (number of blocks) is dynamic.
+    struct StateTableInfo {
+        std::string name;
+        ov::element::Type precision;
+        ov::PartialShape partial_shape;
+    };
+
+    /// @return All state tables, group by group, in ascending layer index order within each group.
+    std::vector<StateTableInfo> get_state_table_infos() const {
+        std::vector<StateTableInfo> state_tables;
+        state_tables.reserve(m_num_cache_tensors);
+        for (const auto& group : m_groups) {
+            for (size_t layer_idx : group.sorted_indices) {
+                const LayerInfo& layer = group.layers.at(layer_idx);
+                state_tables.push_back({layer.full_name, layer.precision, layer.partial_shape});
+            }
+        }
+        return state_tables;
+    }
+
+    /// @return Allocated state tensors in the order of get_state_table_infos; empty before the cache is allocated.
+    std::vector<ov::Tensor> get_state_table_tensors() const {
+        std::vector<ov::Tensor> tensors;
+        tensors.reserve(m_num_cache_tensors);
+        for (const auto& group : m_groups) {
+            for (size_t layer_idx : group.sorted_indices) {
+                tensors.push_back(group.layers.at(layer_idx).tensor);
+            }
+        }
+        return tensors;
+    }
+
     void allocate_cache_if_needed(size_t num_blocks) override {
         if (m_num_allocated_blocks >= num_blocks)
             return;

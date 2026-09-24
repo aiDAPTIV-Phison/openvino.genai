@@ -132,6 +132,9 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
 }
 
 ContinuousBatchingPipeline::ContinuousBatchingImpl::~ContinuousBatchingImpl() {
+    // the cache store finishes its writes while the cache it copies from still exists
+    m_cache_store.reset();
+
     // manually release all blocks, which can re-initialize OpenVINO plugins during destruction
     if (m_model_runner) {
         m_model_runner->get_infer_request().get_compiled_model().release_memory();
@@ -201,6 +204,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(std
     };
     auto cache_orchestrator = CacheOrchestrator::create(infer_request, normalized_config, get_available_memory);
     m_num_decoder_layers = cache_orchestrator->get_num_kv_layers();
+    m_cache_store = cache_store::CacheStoreTier::create(normalized_config, cache_orchestrator, properties, execution_device);
 
     bool can_use_partial_preemption = true;
     if (execution_device.find("GPU") != std::string::npos && !normalized_config.dynamic_split_fuse) {
