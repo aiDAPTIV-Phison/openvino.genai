@@ -8,7 +8,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -91,6 +90,14 @@ private:
         bool allocated = false;
     };
 
+    /// How a block is written, from what the reload's probes found in the store. Stored bytes depend on the history of
+    /// the computation (FINDINGS F8), so the first write of a key stays and a present key is never written again.
+    enum class StoreWrite : std::uint8_t {
+        IfAbsent,  // never probed: written only when the store does not hold the key
+        Always,    // absent, or present but failed verification: written, over any old one
+        Never,     // present and trusted
+    };
+
     /// What the tier keeps per request (one sequence).
     struct RequestState {
         RequestState(SequenceGroup::Ptr request_group, std::size_t block_size, const SipHash128::Key& witness_key)
@@ -103,9 +110,9 @@ private:
         std::size_t write_cursor = 0;
         bool writes_immediately = false;
         std::unique_ptr<ReloadPlan> reload;
-        // what the reload's probes found in the store, so it is not written again (the first write of a key stays)
-        std::vector<bool> stored_blocks;
-        std::set<std::size_t> stored_checkpoints;
+        // what the reload's probes found in the store; a block or checkpoint missing here was not probed (IfAbsent)
+        std::vector<StoreWrite> kv_writes;                    // by KV block index
+        std::map<std::size_t, StoreWrite> checkpoint_writes;  // by end position
     };
 
     /// One block to read and where it goes.
@@ -124,6 +131,7 @@ private:
         OvKVCacheBlockKey key{};
         std::size_t end_position = 0;
         Digest128 witness_chain{0, 0};
+        bool if_absent = false;  // probed on the I/O pool first, and skipped when the store holds the key
     };
 
     /// A batch of blocks of one channel, written by one provider call on the I/O pool.
@@ -161,11 +169,12 @@ private:
     /// @return Why a block read back cannot be used, or an empty string when it is verified.
     std::string verify(RequestState& state, const BlockRead& read) const;
 
-    /// Stops trusting what the probes found from @p token_position on: blocks and checkpoints there are written again
+    /// Stops trusting what the probes found after @p token_position: blocks and checkpoints there are written again
     /// once the request recomputes them.
     void forget_stored_from(RequestState& state, std::size_t token_position) const;
 
-    /// Runs on the I/O pool: completes the witnesses and calls the provider.
+    /// Runs on the I/O pool: drops the IfAbsent blocks the store already holds, completes the witnesses and calls the
+    /// provider.
     void run_write_batch(WriteBatch& batch);
 
     std::vector<ov::Tensor> cache_tensors(const StoreChannel& channel) const;

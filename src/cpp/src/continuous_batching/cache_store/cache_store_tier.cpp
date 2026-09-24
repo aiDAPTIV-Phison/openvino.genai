@@ -276,10 +276,16 @@ std::string CacheStoreTier::verify(RequestState& state, const BlockRead& item) c
 }
 
 void CacheStoreTier::forget_stored_from(RequestState& state, std::size_t token_position) const {
-    for (std::size_t block = token_position / m_kv_channel->block_size_tokens; block < state.stored_blocks.size(); ++block) {
-        state.stored_blocks[block] = false;
+    for (std::size_t block = token_position / m_kv_channel->block_size_tokens; block < state.kv_writes.size(); ++block) {
+        if (state.kv_writes[block] == StoreWrite::Never) {
+            state.kv_writes[block] = StoreWrite::Always;
+        }
     }
-    state.stored_checkpoints.erase(state.stored_checkpoints.upper_bound(token_position), state.stored_checkpoints.end());
+    for (auto it = state.checkpoint_writes.upper_bound(token_position); it != state.checkpoint_writes.end(); ++it) {
+        if (it->second == StoreWrite::Never) {
+            it->second = StoreWrite::Always;
+        }
+    }
 }
 
 void CacheStoreTier::plan_reload(RequestState& state) {
@@ -336,6 +342,11 @@ void CacheStoreTier::plan_reload(RequestState& state) {
                     unknown_checkpoints.push_back(checkpoint);
                 }
             }
+            // A checkpoint at the prompt's end is never a reload position (a token is always computed), but knowing
+            // whether the store holds it spares writing it again
+            if (round == 1 && prompt_len % interval == 0) {
+                unknown_checkpoints.push_back(prompt_len);
+            }
             std::vector<std::size_t> checkpoint_blocks;
             for (std::size_t checkpoint : unknown_checkpoints) {
                 checkpoint_blocks.push_back(checkpoint / block_size - 1);
@@ -360,14 +371,14 @@ void CacheStoreTier::plan_reload(RequestState& state) {
             break;
         }
     }
-    state.stored_blocks.assign(num_complete, false);
+    state.kv_writes.assign(num_complete, StoreWrite::IfAbsent);
     for (std::size_t block = first_block; block < num_complete; ++block) {
-        state.stored_blocks[block] = kv_present[block] == 1;
+        if (kv_present[block] >= 0) {
+            state.kv_writes[block] = kv_present[block] == 1 ? StoreWrite::Never : StoreWrite::Always;
+        }
     }
     for (const auto& [checkpoint, present] : la_present) {
-        if (present) {
-            state.stored_checkpoints.insert(checkpoint);
-        }
+        state.checkpoint_writes[checkpoint] = present ? StoreWrite::Never : StoreWrite::Always;
     }
     if (position <= device_tokens) {
         diagnostics.miss_reason = "not in the store";
@@ -429,7 +440,11 @@ void CacheStoreTier::plan_reload(RequestState& state) {
         const std::string la_failure = verify(state, reads.back());
         if (!la_failure.empty()) {
             // the blocks before it verified; checkpoints from this one on are written again
-            state.stored_checkpoints.erase(state.stored_checkpoints.lower_bound(position), state.stored_checkpoints.end());
+            for (auto it = state.checkpoint_writes.lower_bound(position); it != state.checkpoint_writes.end(); ++it) {
+                if (it->second == StoreWrite::Never) {
+                    it->second = StoreWrite::Always;
+                }
+            }
             failure = failure.empty() ? la_failure : failure;
         }
         if (!failure.empty() || verified_blocks < num_blocks) {
@@ -634,9 +649,15 @@ void CacheStoreTier::write_complete_blocks(RequestState& state, bool within_budg
             }
         }
         // what the store already has stays as it is: the first write of a key wins
-        const bool write_kv = block >= state.stored_blocks.size() || !state.stored_blocks[block];
-        if (la_row && state.stored_checkpoints.count(end_position)) {
-            la_row.reset();
+        const StoreWrite kv_write = block < state.kv_writes.size() ? state.kv_writes[block] : StoreWrite::IfAbsent;
+        const bool write_kv = kv_write != StoreWrite::Never;
+        StoreWrite la_write = StoreWrite::IfAbsent;
+        if (la_row) {
+            const auto known = state.checkpoint_writes.find(end_position);
+            la_write = known == state.checkpoint_writes.end() ? StoreWrite::IfAbsent : known->second;
+            if (la_write == StoreWrite::Never) {
+                la_row.reset();
+            }
         }
         const std::size_t bytes = (write_kv ? m_kv_channel->block_bytes : 0) + (la_row ? m_la_channel->block_bytes : 0);
         if (within_budget && m_step_copied_bytes > 0 &&
@@ -654,14 +675,16 @@ void CacheStoreTier::write_complete_blocks(RequestState& state, bool within_budg
             kv_batch->blocks.push_back({std::move(kv_payload),
                                         make_key(*m_kv_channel, state.identity.key(m_shared.root, block, m_kv_channel->group)),
                                         end_position,
-                                        state.identity.witness_chain(block)});
+                                        state.identity.witness_chain(block),
+                                        kv_write == StoreWrite::IfAbsent});
         }
         if (la_row) {
             la_transfers.push_back({*la_row, la_payload.data()});
             la_batch->blocks.push_back({std::move(la_payload),
                                         make_key(*m_la_channel, state.identity.key(m_shared.root, block, m_la_channel->group)),
                                         end_position,
-                                        state.identity.witness_chain(block)});
+                                        state.identity.witness_chain(block),
+                                        la_write == StoreWrite::IfAbsent});
         }
         m_step_copied_bytes += bytes;
         state.write_cursor = block + 1;
@@ -683,10 +706,33 @@ void CacheStoreTier::write_complete_blocks(RequestState& state, bool within_budg
 
 void CacheStoreTier::run_write_batch(WriteBatch& batch) {
     const StoreChannel& channel = *batch.channel;
-    const std::size_t count = batch.blocks.size();
-    std::vector<std::array<std::uint8_t, WitnessRecord::SIZE>> witnesses(count);
-    std::vector<OvKVCacheStoreWriteRequest> requests(count);
-    for (std::size_t i = 0; i < count; ++i) {
+    // A block the reload never probed (e.g. of generated tokens) is written only if the store does not hold its key
+    std::vector<bool> skipped(batch.blocks.size(), false);
+    std::vector<std::size_t> unknown;
+    std::vector<OvKVCacheBlockKey> unknown_keys;
+    for (std::size_t i = 0; i < batch.blocks.size(); ++i) {
+        if (batch.blocks[i].if_absent) {
+            unknown.push_back(i);
+            unknown_keys.push_back(batch.blocks[i].key);
+        }
+    }
+    if (!unknown.empty() && batch.store->can_probe()) {
+        std::vector<std::uint8_t> present(unknown.size(), 0);
+        if (batch.store->has_blocks(unknown_keys.data(), present.data(), unknown_keys.size()) == OV_KVCACHE_OK) {
+            for (std::size_t j = 0; j < unknown.size(); ++j) {
+                skipped[unknown[j]] = present[j] == 1;
+            }
+        }
+    }
+
+    std::vector<std::array<std::uint8_t, WitnessRecord::SIZE>> witnesses;
+    std::vector<OvKVCacheStoreWriteRequest> requests;
+    witnesses.reserve(batch.blocks.size());  // requests point into it
+    requests.reserve(batch.blocks.size());
+    for (std::size_t i = 0; i < batch.blocks.size(); ++i) {
+        if (skipped[i]) {
+            continue;
+        }
         const BlockWrite& block = batch.blocks[i];
         WitnessRecord record;
         record.expires_at = batch.expires_at;
@@ -696,11 +742,17 @@ void CacheStoreTier::run_write_batch(WriteBatch& batch) {
         }
         record.digest = compute_witness_digest(m_witness_key, batch.root, channel.group, block.end_position,
                                                block.witness_chain, record);
-        witnesses[i] = record.encode();
-        requests[i].key = block.key;
-        requests[i].source = block.payload.data();
-        requests[i].bytes = channel.block_bytes;
-        requests[i].witness = {witnesses[i].data(), witnesses[i].size()};
+        witnesses.push_back(record.encode());
+        OvKVCacheStoreWriteRequest request{};
+        request.key = block.key;
+        request.source = block.payload.data();
+        request.bytes = channel.block_bytes;
+        request.witness = {witnesses.back().data(), witnesses.back().size()};
+        requests.push_back(request);
+    }
+    const std::size_t count = requests.size();
+    if (count == 0) {
+        return;
     }
 
     std::vector<OvKVCacheStoreWriteResult> results(count);
