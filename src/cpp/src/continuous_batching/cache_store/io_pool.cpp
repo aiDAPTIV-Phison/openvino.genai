@@ -58,6 +58,8 @@ void IoPool::run() {
         }
         // a packaged task stores what the task throws in its future
         task();
+        // release what the task holds (staging leases of a write) before it counts as done for drain()
+        task = std::packaged_task<void()>();
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             --m_running;

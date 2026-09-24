@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "continuous_batching/cache/cache_overwrite_observer.hpp"
 #include "continuous_batching/cache_store/block_codec.hpp"
 #include "continuous_batching/cache_store/content_identity.hpp"
 #include "continuous_batching/cache_store/hashing.hpp"
@@ -37,9 +38,9 @@ namespace ov::genai::cache_store {
  * provider_abi.hpp). It owns content identity, namespaces, staging and I/O, and talks to one store provider.
  *
  * Threads: `on_add_request` runs on the caller of `add_request`; the other hooks run on the pipeline's step thread;
- * every provider call runs on the I/O pool.
+ * provider calls run on the I/O pool, the completion thread, or (asynchronous reads) the caller of `add_request`.
  */
-class CacheStoreTier {
+class CacheStoreTier : public ICacheOverwriteObserver {
 public:
     /**
      * @brief Sets up the tier for a pipeline whose cache orchestrator exists.
@@ -51,8 +52,9 @@ public:
                                                   const ov::AnyMap& properties,
                                                   const std::string& device);
 
-    /// Waits for every write in flight, then flushes the stores.
-    ~CacheStoreTier();
+    /// Writes back the blocks `on_evict` still holds in the device cache, waits for every write in flight, then flushes
+    /// the stores.
+    ~CacheStoreTier() override;
 
     CacheStoreTier(const CacheStoreTier&) = delete;
     CacheStoreTier& operator=(const CacheStoreTier&) = delete;
@@ -69,11 +71,19 @@ public:
     void upload_reloads();
 
     /// After sampling and the linear attention checkpoint commit of a step: writes the blocks the scheduled requests
-    /// completed, as far as the step's transfer budget allows.
+    /// completed (`immediate`) or reused from the device prefix cache (`on_access_selective`), as far as the step's
+    /// transfer budget allows.
     void after_step(const std::vector<SequenceGroup::Ptr>& requests, const std::vector<std::uint64_t>& scheduled_group_ids);
 
-    /// Before the scheduler frees a sequence: writes every complete block not written yet, then forgets the sequence.
+    /// Before the scheduler frees a sequence: writes what its trigger still owes, or (`on_evict`) remembers its blocks
+    /// for write-back when the device cache evicts them; then forgets the sequence.
     void on_free_sequence(std::uint64_t seq_id);
+
+    /// Allocation evicts a cached block: an `on_evict` block is queued for write-back.
+    void on_overwrite(CacheType type, uint64_t hash, size_t block_index) override;
+
+    /// Inside `schedule()`, before any device write of the step: copies the evicted blocks out and queues their writes.
+    void before_block_writes() override;
 
 private:
     /// A namespace opened in the provider: its bytes, its store instance and the root of its key chains.
@@ -101,6 +111,15 @@ private:
         Never,     // present and trusted
     };
 
+    /// When a request's blocks are written: the engine trigger (guide section 14.1) adjusted by the request's policy
+    /// (section 14.2; interpretations I7-I10).
+    enum class WriteMode : std::uint8_t {
+        None,       // `explicit_only`, or an explicit-only request: only push_cache writes
+        Immediate,  // every block as soon as it is complete
+        OnAccess,   // the blocks the request reused from the device prefix cache (`on_access_selective`)
+        OnEvict,    // when the device cache evicts the blocks, or when the pipeline is destroyed
+    };
+
     /// What the tier keeps per request (one sequence).
     struct RequestState {
         RequestState(SequenceGroup::Ptr request_group, std::size_t block_size, const SipHash128::Key& witness_key)
@@ -109,9 +128,12 @@ private:
 
         SequenceGroup::Ptr group;
         SequenceIdentity identity;
-        // next block to write; blocks before it are in the store or came from it
+        WriteMode write_mode = WriteMode::None;
+        // Immediate: next block to write; blocks before it are in the store or came from it
         std::size_t write_cursor = 0;
-        bool writes_immediately = false;
+        // OnAccess: the complete blocks the device prefix cache supplied, and the next of them to write
+        std::size_t reused_blocks = 0;
+        std::size_t access_cursor = 0;
         std::unique_ptr<ReloadPlan> reload;
         // what the reload's probes found in the store; a block or checkpoint missing here was not probed (IfAbsent)
         std::vector<StoreWrite> kv_writes;                    // by KV block index
@@ -147,6 +169,16 @@ private:
         std::vector<BlockWrite> blocks;
     };
 
+    /// A block a finished `on_evict` request left in the device prefix cache: what its write needs once it is evicted.
+    struct WriteBack {
+        const StoreChannel* channel = nullptr;
+        OvKVCacheContentHash key{0, 0};
+        std::size_t end_position = 0;
+        Digest128 witness_chain{0, 0};
+        std::uint64_t ttl_seconds = 0;  // 0 = unlimited
+        bool if_absent = true;
+    };
+
     /// A write batch submitted to an asynchronous store: everything the plugin may touch stays here, unmodified, until
     /// `wait` reports a terminal status (guide section 9).
     struct InflightWrite {
@@ -166,8 +198,33 @@ private:
     /// Opens the namespace of a scope; when the provider fails, falls back to the built-in "file" provider for good.
     bool open_namespace(const std::string& scope, OpenNamespace& opened);
 
-    /// Copies the request's complete blocks from the write cursor on into staging and queues their writes.
+    /// @return How the request's blocks are written, from the engine trigger and the request's policy.
+    WriteMode write_mode_of(const PromptCachePolicy& policy) const;
+
+    /// Immediate: writes the request's complete blocks from the write cursor on.
     void write_complete_blocks(RequestState& state, bool within_budget);
+
+    /// OnAccess: writes the blocks the request reused from the device prefix cache.
+    void write_reused_blocks(RequestState& state, bool within_budget);
+
+    /// Copies KV blocks [first_block, end_block) of the request, and the linear attention checkpoints ending in them,
+    /// into staging and queues their writes; what the store holds is skipped (StoreWrite).
+    /// @return The first block not handled: end_block, or where the step budget or the staging pool stopped it.
+    std::size_t write_blocks(RequestState& state, std::size_t first_block, std::size_t end_block, bool within_budget);
+
+    /// OnEvict: remembers the request's complete blocks and checkpoints, by prefix hash, for write-back on eviction.
+    void remember_for_write_back(RequestState& state);
+
+    /// Copies blocks out of the device cache (physical block index each) and queues their writes. Not bound by the step
+    /// budget: an evicted block is overwritten in this step. @return Which blocks were queued; the others found no
+    /// staging space.
+    std::vector<bool> write_back(const std::vector<std::pair<WriteBack, std::size_t>>& blocks);
+
+    /// Destruction: writes back every remembered block still in the device cache, as far as staging allows per round.
+    void write_back_cached_blocks();
+
+    /// Waits until every queued write is terminal and its staging is free again.
+    void wait_for_writes();
 
     /// Discover and verify (guide section 11): probes the store beyond the device prefix, converges on the prefix every
     /// channel can serve, reads it into staging and verifies it.
@@ -231,10 +288,19 @@ private:
     std::atomic<std::size_t> m_failed_writes{0};
     std::atomic<bool> m_reported_write_failure{false};
 
+    // OnEvict: blocks of finished requests still in the device cache, by cache type and prefix hash, and the ones
+    // evicted in the current step with their physical block index. Never held while calling the orchestrator.
+    std::mutex m_write_back_mutex;
+    std::map<std::pair<CacheType, std::uint64_t>, WriteBack> m_write_back;
+    std::vector<std::pair<WriteBack, std::size_t>> m_evicted;
+    std::atomic<bool> m_reported_write_back_loss{false};
+
     // Write batches an asynchronous store is working on, and the thread that waits for them (started with the first)
     std::mutex m_inflight_mutex;
     std::condition_variable m_inflight_added;
+    std::condition_variable m_inflight_done;
     std::deque<std::unique_ptr<InflightWrite>> m_inflight_writes;
+    std::size_t m_inflight_count = 0;  // submitted and not yet accounted
     bool m_stop_completion = false;
     std::thread m_completion_thread;
 

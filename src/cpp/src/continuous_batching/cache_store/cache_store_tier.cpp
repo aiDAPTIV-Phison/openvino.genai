@@ -63,6 +63,11 @@ std::unique_ptr<CacheStoreTier> CacheStoreTier::create(const SchedulerConfig& co
     OPENVINO_ASSERT(orchestrator->has_kv_cache(), "The cache store requires a model with a KV cache");
 
     std::vector<StoreChannel> channels = describe_channels(*orchestrator);
+    for (const StoreChannel& channel : channels) {
+        OPENVINO_ASSERT(channel.block_bytes <= store_config.staging_bytes,
+                        "The cache store's staging_bytes (", store_config.staging_bytes, ") cannot hold one '",
+                        channel.group, "' block of this model (", channel.block_bytes, " bytes)");
+    }
     std::filesystem::path models_path;
     const auto models_path_it = properties.find(ov::cache_model_path.name());
     if (models_path_it != properties.end()) {
@@ -81,6 +86,10 @@ std::unique_ptr<CacheStoreTier> CacheStoreTier::create(const SchedulerConfig& co
         new CacheStoreTier(store_config, std::move(orchestrator), std::move(channels), fingerprints, std::move(provider)));
     if (!tier->open_namespace(scope_key(SharedScope{}), tier->m_shared)) {
         return nullptr;
+    }
+    // Under any trigger but explicit_only a request can end up writing on eviction (its own policy can downgrade to it)
+    if (store_config.write.device_to_store.trigger != WriteTrigger::ExplicitOnly) {
+        tier->m_orchestrator->set_overwrite_observer(tier.get());
     }
     GENAI_INFO("Cache store: provider '" + tier->m_provider->name() + "' (" + tier->m_provider->origin() + "), " +
                std::to_string(tier->m_channels.size()) + " channel(s)\n" + channels_to_string(tier->m_channels));
@@ -117,6 +126,9 @@ CacheStoreTier::CacheStoreTier(const CacheStoreConfig& config,
 }
 
 CacheStoreTier::~CacheStoreTier() {
+    m_orchestrator->set_overwrite_observer(nullptr);
+    // the device cache still exists: what on_evict still holds there is written now (interpretation I10)
+    write_back_cached_blocks();
     m_io_pool.drain();
     // every batch is submitted now; the completion thread waits for the last ones to reach a terminal status
     {
@@ -171,17 +183,34 @@ void CacheStoreTier::on_add_request(const SequenceGroup::Ptr& group) {
 
     const std::size_t block_size = m_kv_channel->block_size_tokens;
     auto state = std::make_unique<RequestState>(group, block_size, m_witness_key);
+    state->write_mode = write_mode_of(sampling_params.prompt_cache);
     // A block the device cache supplied is never written again, even when its last token is recomputed: that rewrites
     // the block's quantization data, so its bytes would differ from the ones already stored under the same key
     state->write_cursor = (group->get_num_processed_tokens() + block_size - 1) / block_size;
-    const PromptCachePolicy& policy = sampling_params.prompt_cache;
-    state->writes_immediately = m_config.write.device_to_store.trigger == WriteTrigger::Immediate &&
-                                !policy.is_explicit_only() && !policy.opt_out_write_through;
+    // on_access_selective: the complete blocks the device cache supplied are the ones proven reused
+    state->reused_blocks = group->get_num_processed_tokens() / block_size;
     plan_reload(*state);
 
     const std::uint64_t seq_id = (*group)[0]->get_id();
     std::lock_guard<std::mutex> lock(m_requests_mutex);
     m_requests[seq_id] = std::move(state);
+}
+
+CacheStoreTier::WriteMode CacheStoreTier::write_mode_of(const PromptCachePolicy& policy) const {
+    if (policy.is_explicit_only()) {
+        return WriteMode::None;  // I7: an explicit-only request is written by push_cache only
+    }
+    switch (m_config.write.device_to_store.trigger) {
+    case WriteTrigger::Immediate:
+        return policy.opt_out_write_through ? WriteMode::OnEvict : WriteMode::Immediate;  // I8: opt-out downgrades
+    case WriteTrigger::OnAccessSelective:
+        return policy.opt_out_write_through ? WriteMode::OnEvict : WriteMode::OnAccess;
+    case WriteTrigger::OnEvict:
+        return WriteMode::OnEvict;
+    case WriteTrigger::ExplicitOnly:
+        return WriteMode::None;
+    }
+    return WriteMode::None;
 }
 
 std::vector<bool> CacheStoreTier::probe(RequestState& state,
@@ -656,8 +685,13 @@ void CacheStoreTier::after_step(const std::vector<SequenceGroup::Ptr>& requests,
             const auto it = m_requests.find((*group)[0]->get_id());
             state = it == m_requests.end() ? nullptr : it->second.get();
         }
-        if (state && state->writes_immediately) {
+        if (!state) {
+            continue;
+        }
+        if (state->write_mode == WriteMode::Immediate) {
             write_complete_blocks(*state, true);
+        } else if (state->write_mode == WriteMode::OnAccess) {
+            write_reused_blocks(*state, true);
         }
     }
 }
@@ -674,8 +708,46 @@ void CacheStoreTier::on_free_sequence(std::uint64_t seq_id) {
         m_requests.erase(it);
     }
     // the blocks are still the sequence's, so what the step budget held back is written now
-    if (state->writes_immediately) {
+    switch (state->write_mode) {
+    case WriteMode::Immediate:
         write_complete_blocks(*state, false);
+        break;
+    case WriteMode::OnAccess:
+        write_reused_blocks(*state, false);
+        break;
+    case WriteMode::OnEvict:
+        remember_for_write_back(*state);
+        break;
+    case WriteMode::None:
+        break;
+    }
+}
+
+void CacheStoreTier::on_overwrite(CacheType type, uint64_t hash, size_t block_index) {
+    std::lock_guard<std::mutex> lock(m_write_back_mutex);
+    const auto it = m_write_back.find({type, hash});
+    if (it == m_write_back.end()) {
+        return;
+    }
+    // the block gets other content in this step: its bytes are copied out before any device write of the step
+    m_evicted.emplace_back(it->second, block_index);
+    m_write_back.erase(it);
+}
+
+void CacheStoreTier::before_block_writes() {
+    std::vector<std::pair<WriteBack, std::size_t>> evicted;
+    {
+        std::lock_guard<std::mutex> lock(m_write_back_mutex);
+        evicted.swap(m_evicted);
+    }
+    if (evicted.empty()) {
+        return;
+    }
+    const std::vector<bool> queued = write_back(evicted);
+    const std::size_t lost = static_cast<std::size_t>(std::count(queued.begin(), queued.end(), false));
+    if (lost > 0 && !m_reported_write_back_loss.exchange(true)) {
+        GENAI_WARN("Cache store: the staging pool had no space for " + std::to_string(lost) +
+                   " evicted blocks, so they were not written back. Further losses are not reported.");
     }
 }
 
@@ -697,22 +769,39 @@ std::vector<ov::Tensor> CacheStoreTier::cache_tensors(const StoreChannel& channe
 }
 
 void CacheStoreTier::write_complete_blocks(RequestState& state, bool within_budget) {
-    const SequenceGroup& group = *state.group;
-    const Sequence::CPtr sequence = group[0];
-    const std::uint64_t seq_id = sequence->get_id();
+    const std::uint64_t seq_id = (*state.group)[0]->get_id();
     if (!m_orchestrator->has_block_table(seq_id)) {
         return;
     }
-    const std::size_t block_size = m_kv_channel->block_size_tokens;
-    const std::vector<BlocksPerLayer>& kv_block_tables = m_orchestrator->get_kv_block_tables(seq_id);
-    const std::size_t num_complete =
-        std::min(group.get_num_processed_tokens() / block_size, kv_block_tables[0].size());
+    const std::size_t num_complete = std::min(state.group->get_num_processed_tokens() / m_kv_channel->block_size_tokens,
+                                              m_orchestrator->get_kv_block_tables(seq_id)[0].size());
     // speculative decoding can take processed tokens back
     state.write_cursor = std::min(state.write_cursor, num_complete);
-    if (state.write_cursor == num_complete) {
+    state.write_cursor = write_blocks(state, state.write_cursor, num_complete, within_budget);
+}
+
+void CacheStoreTier::write_reused_blocks(RequestState& state, bool within_budget) {
+    const std::uint64_t seq_id = (*state.group)[0]->get_id();
+    if (state.access_cursor >= state.reused_blocks || !m_orchestrator->has_block_table(seq_id)) {
         return;
     }
-    state.identity.extend(group, *sequence, num_complete);
+    const std::size_t end_block = std::min(state.reused_blocks, m_orchestrator->get_kv_block_tables(seq_id)[0].size());
+    state.access_cursor = write_blocks(state, state.access_cursor, end_block, within_budget);
+}
+
+std::size_t CacheStoreTier::write_blocks(RequestState& state,
+                                         std::size_t first_block,
+                                         std::size_t end_block,
+                                         bool within_budget) {
+    if (first_block >= end_block) {
+        return first_block;
+    }
+    const SequenceGroup& group = *state.group;
+    const Sequence::CPtr sequence = group[0];
+    const std::uint64_t seq_id = sequence->get_id();
+    const std::size_t block_size = m_kv_channel->block_size_tokens;
+    const std::vector<BlocksPerLayer>& kv_block_tables = m_orchestrator->get_kv_block_tables(seq_id);
+    state.identity.extend(group, *sequence, end_block);
 
     const PromptCachePolicy& policy = group.get_sampling_parameters().prompt_cache;
     const std::uint64_t expires_at = policy.ttl.is_unlimited() ? 0 : unix_seconds_now() + policy.ttl.get_seconds();
@@ -728,7 +817,8 @@ void CacheStoreTier::write_complete_blocks(RequestState& state, bool within_budg
     const std::shared_ptr<WriteBatch> la_batch = make_batch(m_la_channel);
     std::vector<BlockTransfer> kv_transfers, la_transfers;
 
-    for (std::size_t block = state.write_cursor; block < num_complete; ++block) {
+    std::size_t next = first_block;
+    for (std::size_t block = first_block; block < end_block; ++block) {
         const std::size_t end_position = (block + 1) * block_size;
         // the linear attention state after this block, when a checkpoint ends here
         std::optional<std::size_t> la_row;
@@ -779,7 +869,7 @@ void CacheStoreTier::write_complete_blocks(RequestState& state, bool within_budg
                                         la_write == StoreWrite::IfAbsent});
         }
         m_step_copied_bytes += bytes;
-        state.write_cursor = block + 1;
+        next = block + 1;
     }
 
     CacheDiagnostics& diagnostics = state.group->get_cache_diagnostics();
@@ -794,6 +884,148 @@ void CacheStoreTier::write_complete_blocks(RequestState& state, bool within_budg
             run_write_batch(batch);
         });
     }
+    return next;
+}
+
+void CacheStoreTier::remember_for_write_back(RequestState& state) {
+    const SequenceGroup& group = *state.group;
+    const Sequence::CPtr sequence = group[0];
+    const std::uint64_t seq_id = sequence->get_id();
+    if (!m_orchestrator->has_block_table(seq_id)) {
+        return;
+    }
+    const std::size_t block_size = m_kv_channel->block_size_tokens;
+    const BlocksPerLayer& kv_table = m_orchestrator->get_kv_block_tables(seq_id)[0];
+    const std::size_t num_complete = std::min(group.get_num_processed_tokens() / block_size, kv_table.size());
+    if (num_complete == 0) {
+        return;
+    }
+    state.identity.extend(group, *sequence, num_complete);
+    const PromptCachePolicy& policy = group.get_sampling_parameters().prompt_cache;
+    const std::uint64_t ttl_seconds = policy.ttl.is_unlimited() ? 0 : policy.ttl.get_seconds();
+
+    // collected first: the orchestrator is never called while the write-back lock is held
+    std::vector<std::pair<std::pair<CacheType, std::uint64_t>, WriteBack>> blocks;
+    for (std::size_t block = 0; block < num_complete; ++block) {
+        const std::size_t end_position = (block + 1) * block_size;
+        const StoreWrite kv_write = block < state.kv_writes.size() ? state.kv_writes[block] : StoreWrite::IfAbsent;
+        if (kv_write != StoreWrite::Never) {
+            blocks.push_back({{CacheType::KV_CACHE, kv_table[block]->get_hash()},
+                              WriteBack{m_kv_channel,
+                                        state.identity.key(m_shared.root, block, m_kv_channel->group),
+                                        end_position,
+                                        state.identity.witness_chain(block),
+                                        ttl_seconds,
+                                        kv_write == StoreWrite::IfAbsent}});
+        }
+        if (!m_la_channel || end_position % m_la_channel->block_size_tokens != 0) {
+            continue;
+        }
+        const std::size_t la_position = end_position / m_la_channel->block_size_tokens - 1;
+        const std::size_t la_start = m_orchestrator->get_linear_attention_block_table_logical_start(seq_id);
+        const BlocksPerLayer& la_table = m_orchestrator->get_linear_attention_block_table(seq_id);
+        const auto known = state.checkpoint_writes.find(end_position);
+        const StoreWrite la_write = known == state.checkpoint_writes.end() ? StoreWrite::IfAbsent : known->second;
+        if (la_write != StoreWrite::Never && la_position >= la_start && la_position - la_start < la_table.size()) {
+            blocks.push_back({{CacheType::LINEAR_ATTENTION_CACHE, la_table[la_position - la_start]->get_hash()},
+                              WriteBack{m_la_channel,
+                                        state.identity.key(m_shared.root, block, m_la_channel->group),
+                                        end_position,
+                                        state.identity.witness_chain(block),
+                                        ttl_seconds,
+                                        la_write == StoreWrite::IfAbsent}});
+        }
+    }
+    std::lock_guard<std::mutex> lock(m_write_back_mutex);
+    for (const auto& [id, block] : blocks) {
+        m_write_back[id] = block;
+    }
+}
+
+std::vector<bool> CacheStoreTier::write_back(const std::vector<std::pair<WriteBack, std::size_t>>& blocks) {
+    // one batch per channel and expiry
+    struct Pending {
+        std::shared_ptr<WriteBatch> batch;
+        std::vector<BlockTransfer> transfers;
+    };
+    std::map<std::pair<const StoreChannel*, std::uint64_t>, Pending> batches;
+    std::vector<bool> queued(blocks.size(), false);
+    const std::uint64_t now = unix_seconds_now();
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        const auto& [block, block_index] = blocks[i];
+        StagingLease payload = m_staging.try_acquire(block.channel->block_bytes);
+        if (!payload) {
+            continue;
+        }
+        const std::uint64_t expires_at = block.ttl_seconds == 0 ? 0 : now + block.ttl_seconds;
+        Pending& pending = batches[{block.channel, expires_at}];
+        if (!pending.batch) {
+            pending.batch = std::make_shared<WriteBatch>();
+            pending.batch->store = m_shared.store;
+            pending.batch->channel = block.channel;
+            pending.batch->root = m_shared.root;
+            pending.batch->expires_at = expires_at;
+        }
+        pending.transfers.push_back({block_index, payload.data()});
+        pending.batch->blocks.push_back({std::move(payload),
+                                         make_key(*block.channel, block.key),
+                                         block.end_position,
+                                         block.witness_chain,
+                                         block.if_absent});
+        queued[i] = true;
+    }
+    for (auto& [id, pending] : batches) {
+        m_codec.download(*pending.batch->channel, cache_tensors(*pending.batch->channel), pending.transfers);
+        m_io_pool.submit([this, batch = pending.batch] {
+            run_write_batch(batch);
+        });
+    }
+    return queued;
+}
+
+void CacheStoreTier::write_back_cached_blocks() {
+    std::map<std::pair<CacheType, std::uint64_t>, WriteBack> remembered;
+    {
+        std::lock_guard<std::mutex> lock(m_write_back_mutex);
+        remembered.swap(m_write_back);
+    }
+    std::vector<std::pair<WriteBack, std::size_t>> pending;
+    for (const auto& [id, block] : remembered) {
+        // a hash that no longer names cached content (it was dropped without an eviction) has nothing to write
+        const std::optional<std::size_t> block_index = m_orchestrator->find_cached_block_index(id.first, id.second);
+        if (block_index) {
+            pending.emplace_back(block, *block_index);
+        }
+    }
+    // In rounds: each queues what fits in staging, the next starts once those writes are done
+    bool staging_idle = false;
+    while (!pending.empty()) {
+        const std::vector<bool> queued = write_back(pending);
+        std::vector<std::pair<WriteBack, std::size_t>> rest;
+        for (std::size_t i = 0; i < pending.size(); ++i) {
+            if (!queued[i]) {
+                rest.push_back(pending[i]);
+            }
+        }
+        if (rest.size() == pending.size() && staging_idle) {
+            GENAI_WARN("Cache store: " + std::to_string(rest.size()) +
+                       " blocks are larger than the staging pool and were not written back");
+            break;
+        }
+        pending.swap(rest);
+        if (!pending.empty()) {
+            wait_for_writes();
+            staging_idle = true;
+        }
+    }
+}
+
+void CacheStoreTier::wait_for_writes() {
+    m_io_pool.drain();
+    std::unique_lock<std::mutex> lock(m_inflight_mutex);
+    m_inflight_done.wait(lock, [this] {
+        return m_inflight_count == 0;
+    });
 }
 
 void CacheStoreTier::run_write_batch(const std::shared_ptr<WriteBatch>& batch) {
@@ -855,6 +1087,7 @@ void CacheStoreTier::run_write_batch(const std::shared_ptr<WriteBatch>& batch) {
             if (!m_completion_thread.joinable()) {
                 m_completion_thread = std::thread(&CacheStoreTier::complete_writes, this);
             }
+            ++m_inflight_count;
             m_inflight_writes.push_back(std::move(write));
             m_inflight_added.notify_one();
             return;
@@ -920,7 +1153,13 @@ void CacheStoreTier::complete_writes() {
             status = write->batch->store->wait(write->token, OV_KVCACHE_WAIT_INFINITE);
         }
         finish_write(*write->batch, write->requests, write->results, status);
-        // releasing `write` returns the batch's staging leases, now that the plugin no longer touches them
+        // returns the batch's staging leases, now that the plugin no longer touches them
+        write.reset();
+        {
+            std::lock_guard<std::mutex> lock(m_inflight_mutex);
+            --m_inflight_count;
+        }
+        m_inflight_done.notify_all();
     }
 }
 

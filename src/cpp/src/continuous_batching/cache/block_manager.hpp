@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <functional>
 #include <list>
 #include <map>
 #include <optional>
@@ -211,6 +212,8 @@ public:
     struct CacheBlockAllocationResult {
         BlocksPerLayer blocks;
         std::optional<uint64_t> erased_hash;
+        // Prefix hash of the cached content the blocks held when they were reused from the overwritable store
+        std::optional<uint64_t> overwritten_hash;
 
         operator BlocksPerLayer&() {
             return blocks;
@@ -543,6 +546,7 @@ public:
             // get least recently used block from store and reuse it
             result.blocks = m_overwriteable_blocks.get_lru_block_to_overwrite();
             const uint64_t previous_hash = result.blocks[0]->get_hash();
+            result.overwritten_hash = previous_hash;
             if (cached_blocks.erase(previous_hash) > 0) {
                 result.erased_hash = previous_hash;
             }
@@ -642,6 +646,8 @@ class BlockManager {
     std::map<uint64_t, size_t> m_block_table_logical_start;
 
     std::mutex m_cached_blocks_map_mutex;
+    // see set_overwrite_listener
+    std::function<void(uint64_t hash, size_t block_index)> m_overwrite_listener;
 public:
     struct PrefixRestorePlan {
         std::vector<size_t> block_content_lengths;
@@ -1241,6 +1247,29 @@ public:
      */
     size_t get_total_block_count() const {
         return m_allocator.get_total_block_count();
+    }
+
+    /// Receives the prefix hash and physical index of cached content whose blocks are reused for other content.
+    using OverwriteListener = std::function<void(uint64_t hash, size_t block_index)>;
+
+    /**
+     * @brief Sets the listener called when cached content is evicted: its blocks are reused for other content during
+     * allocation. The listener must not call back into this BlockManager. An empty listener removes it.
+     */
+    void set_overwrite_listener(OverwriteListener listener) {
+        m_overwrite_listener = std::move(listener);
+    }
+
+    /**
+     * @return The physical index of the block that holds the cached content of a prefix hash, if it is still cached.
+     */
+    std::optional<size_t> find_cached_block_index(uint64_t hash) {
+        std::lock_guard<std::mutex> lock(m_cached_blocks_map_mutex);
+        const auto it = m_prefix_hash_to_cached_blocks.find(hash);
+        if (it == m_prefix_hash_to_cached_blocks.end() || it->second.empty()) {
+            return std::nullopt;
+        }
+        return static_cast<size_t>(it->second[0]->get_index());
     }
 
     /**
@@ -1880,6 +1909,10 @@ private:
         BlockAllocator::CacheBlockAllocationResult allocation_result = m_allocator.allocate_block(hash, m_prefix_hash_to_cached_blocks);
         if (allocation_result.erased_hash.has_value()) {
             unregister_cached_hash(*allocation_result.erased_hash);
+        }
+        if (allocation_result.overwritten_hash.has_value() && m_overwrite_listener) {
+            m_overwrite_listener(*allocation_result.overwritten_hash,
+                                 static_cast<size_t>(allocation_result.blocks[0]->get_index()));
         }
         register_cached_content_length(hash, content_length);
         return allocation_result.blocks;

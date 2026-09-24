@@ -17,6 +17,7 @@
 
 #include "openvino/runtime/infer_request.hpp"
 #include "openvino/genai/scheduler_config.hpp"
+#include "continuous_batching/cache/cache_overwrite_observer.hpp"
 #include "continuous_batching/cache/cache_type.hpp"
 #include "continuous_batching/cache/i_cache_manager.hpp"
 #include "continuous_batching/cache/block_manager.hpp"
@@ -125,6 +126,9 @@ public:
     // -----------------------------------------------------------------------
 
     void allocate_cache_if_needed() {
+        if (m_overwrite_observer) {
+            m_overwrite_observer->before_block_writes();
+        }
         for (auto& [type, block_mgr] : m_block_managers) {
             m_cache_managers.at(type)->allocate_cache_if_needed(block_mgr->get_total_block_count());
         }
@@ -132,6 +136,30 @@ public:
             m_cache_managers.at(type)->zero_blocks(block_indices);
         }
         m_pending_zero_blocks.clear();
+    }
+
+    /**
+     * @brief Sets the observer of evicted cached blocks of every registered cache type, or removes it (nullptr). The
+     * observer must outlive its registration.
+     */
+    void set_overwrite_observer(ICacheOverwriteObserver* observer) {
+        m_overwrite_observer = observer;
+        for (auto& [type, block_mgr] : m_block_managers) {
+            BlockManager::OverwriteListener listener;
+            if (observer) {
+                listener = [observer, type = type](uint64_t hash, size_t block_index) {
+                    observer->on_overwrite(type, hash, block_index);
+                };
+            }
+            block_mgr->set_overwrite_listener(std::move(listener));
+        }
+    }
+
+    /// @return The physical index of the block of @p type that holds the cached content of a prefix hash, if cached.
+    std::optional<size_t> find_cached_block_index(CacheType type, uint64_t hash) {
+        const auto it = m_block_managers.find(type);
+        OPENVINO_ASSERT(it != m_block_managers.end(), "Cache type not registered");
+        return it->second->find_cached_block_index(hash);
     }
 
     void copy_blocks(const std::map<CacheType, std::map<size_t, std::list<size_t>>>& per_type_copy_map) {
@@ -980,6 +1008,7 @@ private:
     std::map<CacheType, std::unique_ptr<BlockManager>> m_block_managers;
     bool m_use_per_layer_kv_block_indices = false;
     std::map<CacheType, std::set<size_t>> m_pending_zero_blocks;
+    ICacheOverwriteObserver* m_overwrite_observer = nullptr;
 
     // Linear-attention pool footprint high-water mark.
     size_t m_linear_attention_pool_blocks_high_water = 0;
