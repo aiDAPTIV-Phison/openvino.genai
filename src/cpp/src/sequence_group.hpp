@@ -931,6 +931,15 @@ public:
         }
     }
 
+    /// Cache facts of this request (prefix cache and cache store), returned with its performance metrics.
+    CacheDiagnostics& get_cache_diagnostics() {
+        return m_perf_metrics.cache_diagnostics;
+    }
+
+    const CacheDiagnostics& get_cache_diagnostics() const {
+        return m_perf_metrics.cache_diagnostics;
+    }
+
     PerfMetrics get_perf_metrics() {
         auto& raw_metrics = m_perf_metrics.raw_metrics;
         if (raw_metrics.m_inference_durations.empty()) {

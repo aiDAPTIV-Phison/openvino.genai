@@ -345,6 +345,13 @@ GenerationHandle ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request
     if (m_scheduler->get_config().enable_prefix_caching) {
         m_scheduler->restore_cached_blocks(sequence_group);
     }
+    CacheDiagnostics& cache_diagnostics = sequence_group->get_cache_diagnostics();
+    cache_diagnostics.prompt_tokens = sequence_group->get_prompt_len();
+    cache_diagnostics.device_hit_tokens = sequence_group->get_num_processed_tokens();
+    cache_diagnostics.served_by = cache_diagnostics.device_hit_tokens > 0 ? CacheTier::Device : CacheTier::None;
+    if (m_cache_store) {
+        m_cache_store->on_add_request(sequence_group);
+    }
 
     {
         std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
@@ -592,6 +599,11 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
     _commit_linear_attention_checkpoint_transactions(scheduler_output);
     borrowed_rows_guard.m_armed = false;
 
+    // Accepted tokens and linear attention checkpoints are final now, so completed blocks can be stored
+    if (m_cache_store) {
+        m_cache_store->after_step(m_requests, scheduler_output.m_scheduled_sequence_groups_ids);
+    }
+
     // process sampler_output (e.g. fork or drop sequences from BlockScheduler)
     {
         static ManualTimer free_fork_timer("fork / free sequence");
@@ -604,8 +616,12 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
                 m_scheduler->fork_sequence(parent_id, child_id);
         }
 
-        for (auto seq_id : sampler_output.m_dropped_sequences)
+        for (auto seq_id : sampler_output.m_dropped_sequences) {
+            if (m_cache_store) {
+                m_cache_store->on_free_sequence(seq_id);
+            }
             m_scheduler->free_sequence(seq_id);
+        }
 
         free_fork_timer.end();
     }
@@ -857,6 +873,7 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::ContinuousBatch
         perf_metrics.raw_metrics.generate_durations.emplace_back(
             PerfMetrics::get_microsec(std::chrono::steady_clock::now() - start_time));
         perf_metrics.num_input_tokens = request->get_prompt_len();
+        perf_metrics.cache_diagnostics = request->get_cache_diagnostics();
         perf_metrics.evaluate_statistics(start_time);
 
         result.perf_metrics = perf_metrics;
@@ -880,6 +897,12 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_free_non_running_reque
     while (requests_iterator != m_requests.end()) {
         const auto& request = *requests_iterator;
         if (request->has_finished() || request->handle_stopped() || request->handle_cancelled()) {
+            // before the metrics are taken, so they include what the store writes when the request ends
+            if (m_cache_store) {
+                for (const auto& sequence : request->get_sequences()) {
+                    m_cache_store->on_free_sequence(sequence->get_id());
+                }
+            }
             auto perf_metrics = request->get_perf_metrics();
             perf_metrics.load_time = m_load_time_ms;
             request->get_generation_stream()->set_perf_metrics(std::move(perf_metrics));
@@ -927,6 +950,9 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_reset_cache_usage_stat
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::drop_requests() {
     for (const std::shared_ptr<ov::genai::SequenceGroup> request : m_requests) {
         for (const auto& sequence : request->get_sequences()) {
+            if (m_cache_store) {
+                m_cache_store->on_free_sequence(sequence->get_id());
+            }
             if (m_scheduler->has_block_table(sequence->get_id())) {
                 m_scheduler->free_sequence(sequence->get_id());
             }
