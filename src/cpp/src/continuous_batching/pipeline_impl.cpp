@@ -491,6 +491,10 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
     step_timer.start();
 
     _pull_awaiting_requests();
+    // Reloads verified since the last step get their device blocks before scheduling sees the requests
+    if (m_cache_store) {
+        m_cache_store->allocate_reloads(m_requests);
+    }
     _validate_linear_verifier_constraints();
     _reserve_linear_attention_scratch();
 
@@ -549,6 +553,11 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
         BorrowedLinearAttentionRowsGuard& operator=(const BorrowedLinearAttentionRowsGuard&) = delete;
     };
     BorrowedLinearAttentionRowsGuard borrowed_rows_guard{*this, scheduler_output};
+
+    // After scheduling, which may grow or zero cache rows, and before any inference reads the reloaded blocks
+    if (m_cache_store) {
+        m_cache_store->upload_reloads();
+    }
 
     ov::Tensor logits;
 
