@@ -4,6 +4,7 @@
 #pragma once
 
 #include <chrono>
+#include "openvino/genai/prompt_cache.hpp"
 #include "openvino/genai/visibility.hpp"
 #include <vector>
 #include <memory>
@@ -145,6 +146,9 @@ struct OPENVINO_GENAI_EXPORTS PerfMetrics {
     size_t num_generated_tokens = 0;
     size_t num_input_tokens = 0;
 
+    // Cache facts of the request and their interpretation (prefix cache and cache store hits, store traffic).
+    CacheDiagnostics cache_diagnostics;
+
     float get_load_time();         // Load time in ms.
     size_t get_num_generated_tokens();
     size_t get_num_input_tokens();
@@ -162,6 +166,8 @@ struct OPENVINO_GENAI_EXPORTS PerfMetrics {
     MeanStdPair get_detokenization_duration();  // in ms
     MeanStdPair get_chat_template_duration();   // in ms
     MeanStdPair get_sampling_duration();        // in ms
+
+    const CacheDiagnostics& get_cache_diagnostics() const;
 
     // Flag indicating if raw metrics were evaluated.
     // If false means current mean/std ttft, tpot, etc. are not actual

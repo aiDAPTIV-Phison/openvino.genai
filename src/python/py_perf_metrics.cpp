@@ -271,6 +271,7 @@ void init_perf_metrics(py::module_& m) {
         .def("get_detokenization_duration", &PerfMetrics::get_detokenization_duration)
         .def("get_chat_template_duration", &PerfMetrics::get_chat_template_duration)
         .def("get_sampling_duration", &PerfMetrics::get_sampling_duration)
+        .def("get_cache_diagnostics", &PerfMetrics::get_cache_diagnostics)
         .def("__add__", &PerfMetrics::operator+, py::arg("metrics"))
         .def("__iadd__", &PerfMetrics::operator+=, py::arg("right"))
         .def_readonly("raw_metrics", &PerfMetrics::raw_metrics);
@@ -290,6 +291,7 @@ void init_perf_metrics(py::module_& m) {
         .def("get_detokenization_duration", &ExtendedPerfMetrics::get_detokenization_duration)
         .def("get_chat_template_duration", &ExtendedPerfMetrics::get_chat_template_duration)
         .def("get_sampling_duration", &ExtendedPerfMetrics::get_sampling_duration)
+        .def("get_cache_diagnostics", &ExtendedPerfMetrics::get_cache_diagnostics)
         .def("__add__", &ExtendedPerfMetrics::operator+, py::arg("metrics"))
         .def("__iadd__", &ExtendedPerfMetrics::operator+=, py::arg("right"))
         .def_readonly("raw_metrics", &ExtendedPerfMetrics::raw_metrics);

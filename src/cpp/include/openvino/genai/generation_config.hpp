@@ -15,6 +15,7 @@
 #include "openvino/genai/scheduler_config.hpp"
 #include "openvino/genai/lora_adapter.hpp"
 #include "openvino/genai/parsers.hpp"
+#include "openvino/genai/prompt_cache.hpp"
 
 namespace ov {
 namespace genai {
@@ -638,6 +639,10 @@ operator|(const StructuredOutputConfig::StructuralTag& lhs,
  * @param return_omni_outputs if set to true, the pipeline accumulates per-token intermediate hidden
  *        states and full token ids in the result so a Qwen3-Omni talker can consume them. Only the
  *        continuous-batching backend supports this; OmniPipeline sets it internally on the audio path.
+ *
+ * @param prompt_cache request-level prompt cache policy (mode, scope, time-to-live, write-through opt-out) applied by a
+ *        pipeline that has a cache store (SchedulerConfig::cache_store). Always present; the default is implicit
+ *        caching in the shared scope with the standard time-to-live.
  */
 class OPENVINO_GENAI_EXPORTS GenerationConfig {
 public:
@@ -707,6 +712,9 @@ public:
     // generation. Only supported by the continuous-batching backend; set internally by OmniPipeline.
     // Preview API: subject to change.
     bool return_omni_outputs = false;
+
+    // Prompt cache policy of this request, used by a pipeline with a cache store
+    PromptCachePolicy prompt_cache;
 
     /** @brief sets eos_token_id to tokenizer_eos_token_id if eos_token_id is less than 0.
      * Otherwise verifies eos_token_id == tokenizer_eos_token_id.
@@ -786,6 +794,8 @@ static constexpr ov::Property<std::string> grammar{"grammar"};
 static constexpr ov::Property<std::string> backend{"backend"};
 
 static constexpr ov::Property<bool> apply_chat_template{"apply_chat_template"};
+
+static constexpr ov::Property<PromptCachePolicy> prompt_cache{"prompt_cache"};
 
 // Preview API: subject to change.
 static constexpr ov::Property<bool> return_omni_outputs{"return_omni_outputs"};

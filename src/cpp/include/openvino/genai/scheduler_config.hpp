@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "openvino/genai/cache_eviction.hpp"
+#include "openvino/genai/cache_store_config.hpp"
 #include "openvino/genai/sparse_attention.hpp"
 
 namespace ov::genai {
@@ -88,6 +89,11 @@ struct SchedulerConfig {
      */
     SparseAttentionConfig sparse_attention_config;
 
+    /** Cache store tier: persists KV cache blocks through a store provider and serves them back to later requests,
+     * also across process restarts. Requires `enable_prefix_caching`.
+     */
+    CacheStoreConfig cache_store;
+
     std::size_t get_cache_interval(std::size_t kv_block_size) const {
         const std::size_t effective_cache_interval_multiplier =
             cache_interval_multiplier.value_or(DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL_MULTIPLIER);
@@ -103,6 +109,7 @@ struct SchedulerConfig {
     void validate() const {
         OPENVINO_ASSERT(!enable_prefix_caching || !cache_interval_multiplier.has_value() || cache_interval_multiplier.value() > 0,
                 "SchedulerConfig cache_interval_multiplier must be greater than 0 when prefix caching is enabled");
+        cache_store.validate();
     }
 
     bool operator==(const SchedulerConfig& other) const {
@@ -110,7 +117,7 @@ struct SchedulerConfig {
                cache_size == other.cache_size && num_linear_attention_blocks == other.num_linear_attention_blocks &&
                dynamic_split_fuse == other.dynamic_split_fuse && use_cache_eviction == other.use_cache_eviction &&
                max_num_seqs == other.max_num_seqs && enable_prefix_caching == other.enable_prefix_caching &&
-               cache_interval_multiplier == other.cache_interval_multiplier;
+               cache_interval_multiplier == other.cache_interval_multiplier && cache_store == other.cache_store;
     }
 
     /**
@@ -142,6 +149,11 @@ struct SchedulerConfig {
         oss << "  use_sparse_attention: " << std::boolalpha << use_sparse_attention << "\n";
         if (use_sparse_attention) {
             oss << sparse_attention_config.to_string() << "\n";
+        }
+        if (cache_store.enable) {
+            oss << cache_store.to_string() << "\n";
+        } else {
+            oss << "  cache_store: disabled\n";
         }
         oss << " }";
         return oss.str();

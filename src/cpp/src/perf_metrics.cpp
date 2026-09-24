@@ -105,6 +105,10 @@ MeanStdPair PerfMetrics::get_sampling_duration() {
     return sampling_duration;
 }
 
+const CacheDiagnostics& PerfMetrics::get_cache_diagnostics() const {
+    return cache_diagnostics;
+}
+
 std::map<std::string, float> PerfMetrics::get_grammar_compiler_init_times() {
     return grammar_compiler_init_times;
 }
@@ -244,6 +248,7 @@ PerfMetrics PerfMetrics::operator+(const PerfMetrics& right) const {
 
     res.num_generated_tokens += right.num_generated_tokens;
     res.num_input_tokens += right.num_input_tokens;
+    res.cache_diagnostics += right.cache_diagnostics;
     res.m_evaluated = false;
     return res;
 }
