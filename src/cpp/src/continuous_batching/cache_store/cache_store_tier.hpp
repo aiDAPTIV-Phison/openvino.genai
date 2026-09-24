@@ -4,11 +4,14 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "continuous_batching/cache_store/block_codec.hpp"
@@ -123,6 +126,7 @@ private:
         std::array<std::uint8_t, 2 * WitnessRecord::SIZE> witness{};
         OvKVCacheStoreReadRequest request{};
         OvKVCacheStoreReadResult result{};
+        std::string failure;  // why the block cannot be used; empty when it is verified
     };
 
     /// One block to write: where its payload is and what identifies it.
@@ -141,6 +145,16 @@ private:
         Digest128 root{0, 0};
         std::uint64_t expires_at = 0;
         std::vector<BlockWrite> blocks;
+    };
+
+    /// A write batch submitted to an asynchronous store: everything the plugin may touch stays here, unmodified, until
+    /// `wait` reports a terminal status (guide section 9).
+    struct InflightWrite {
+        std::shared_ptr<WriteBatch> batch;  // holds the payload leases
+        std::vector<std::array<std::uint8_t, WitnessRecord::SIZE>> witnesses;
+        std::vector<OvKVCacheStoreWriteRequest> requests;
+        std::vector<OvKVCacheStoreWriteResult> results;
+        OvKVCacheAsyncToken token = 0;
     };
 
     CacheStoreTier(const CacheStoreConfig& config,
@@ -162,9 +176,16 @@ private:
     /// Probes the keys of @p blocks of a channel (each KV block index the item ends with); true = present.
     std::vector<bool> probe(RequestState& state, const StoreChannel& channel, const std::vector<std::size_t>& blocks);
 
-    /// Reads the items in batches of consecutive blocks on the I/O pool; a batch that fails as a whole is retried per
-    /// block. @return The number of batches that degraded to per-block reads.
-    std::size_t read(std::vector<BlockRead>& reads);
+    /// Fetches the items in batches of consecutive blocks of one channel and verifies each (sets `failure`). A
+    /// synchronous store reads the batches in parallel on the I/O pool. An asynchronous store gets every batch submitted
+    /// at once from this thread; they are waited for in order, and the first KV block that fails verification cancels
+    /// the batches after it, which can no longer be used. @return The number of batches that degraded to per-block
+    /// reads.
+    std::size_t fetch(RequestState& state, std::vector<BlockRead>& reads);
+
+    /// Reads items [start, end) synchronously; a batch that fails as a whole is retried per block.
+    /// @return Whether the batch degraded to per-block reads.
+    bool read_batch(std::vector<BlockRead>& reads, std::size_t start, std::size_t end) const;
 
     /// @return Why a block read back cannot be used, or an empty string when it is verified.
     std::string verify(RequestState& state, const BlockRead& read) const;
@@ -174,8 +195,17 @@ private:
     void forget_stored_from(RequestState& state, std::size_t token_position) const;
 
     /// Runs on the I/O pool: drops the IfAbsent blocks the store already holds, completes the witnesses and calls the
-    /// provider.
-    void run_write_batch(WriteBatch& batch);
+    /// provider. An asynchronous store gets the batch submitted and handed to the completion thread.
+    void run_write_batch(const std::shared_ptr<WriteBatch>& batch);
+
+    /// Accounts a write batch whose status is terminal; a batch that failed as a whole is retried per block.
+    void finish_write(const WriteBatch& batch,
+                      const std::vector<OvKVCacheStoreWriteRequest>& requests,
+                      std::vector<OvKVCacheStoreWriteResult>& results,
+                      OvKVCacheStatus status);
+
+    /// Completion thread: waits for the submitted write batches in order, the only waiter of their tokens.
+    void complete_writes();
 
     std::vector<ov::Tensor> cache_tensors(const StoreChannel& channel) const;
 
@@ -200,6 +230,13 @@ private:
 
     std::atomic<std::size_t> m_failed_writes{0};
     std::atomic<bool> m_reported_write_failure{false};
+
+    // Write batches an asynchronous store is working on, and the thread that waits for them (started with the first)
+    std::mutex m_inflight_mutex;
+    std::condition_variable m_inflight_added;
+    std::deque<std::unique_ptr<InflightWrite>> m_inflight_writes;
+    bool m_stop_completion = false;
+    std::thread m_completion_thread;
 
     // Declared last so it is destroyed first: its threads finish every queued write while the rest still exists
     IoPool m_io_pool;

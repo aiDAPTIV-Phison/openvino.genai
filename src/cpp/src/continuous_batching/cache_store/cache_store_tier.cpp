@@ -118,6 +118,15 @@ CacheStoreTier::CacheStoreTier(const CacheStoreConfig& config,
 
 CacheStoreTier::~CacheStoreTier() {
     m_io_pool.drain();
+    // every batch is submitted now; the completion thread waits for the last ones to reach a terminal status
+    {
+        std::lock_guard<std::mutex> lock(m_inflight_mutex);
+        m_stop_completion = true;
+    }
+    m_inflight_added.notify_all();
+    if (m_completion_thread.joinable()) {
+        m_completion_thread.join();
+    }
     if (m_shared.store) {
         const OvKVCacheStatus status = m_shared.store->flush();
         if (status != OV_KVCACHE_OK) {
@@ -201,7 +210,7 @@ std::vector<bool> CacheStoreTier::probe(RequestState& state,
     return present;
 }
 
-std::size_t CacheStoreTier::read(std::vector<BlockRead>& reads) {
+std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& reads) {
     for (BlockRead& item : reads) {
         item.request.key = make_key(*item.channel, item.request.key.hash);
         item.request.target.kind = OV_KVCACHE_TARGET_HOST;
@@ -209,42 +218,123 @@ std::size_t CacheStoreTier::read(std::vector<BlockRead>& reads) {
         item.request.target.bytes = item.channel->block_bytes;
         item.request.witness_out = {item.witness.data(), item.witness.size()};
     }
-    // batches of consecutive items of one channel, spread over the I/O threads
+    // batches of consecutive items of one channel, one per I/O thread
     const std::size_t batch_size = std::max<std::size_t>(1, (reads.size() + m_config.io_threads - 1) / m_config.io_threads);
-    std::atomic<std::size_t> degraded{0};
-    std::vector<std::future<void>> done;
+    std::vector<std::pair<std::size_t, std::size_t>> batches;
     for (std::size_t start = 0; start < reads.size();) {
         std::size_t end = start + 1;
         while (end < reads.size() && end - start < batch_size && reads[end].channel == reads[start].channel) {
             ++end;
         }
-        done.push_back(m_io_pool.submit([this, &reads, &degraded, start, end] {
-            const std::size_t count = end - start;
-            std::vector<OvKVCacheStoreReadRequest> requests(count);
-            std::vector<OvKVCacheStoreReadResult> results(count);
-            for (std::size_t i = 0; i < count; ++i) {
-                requests[i] = reads[start + i].request;
-            }
-            const OvKVCacheStatus status = m_shared.store->read_blocks(requests.data(), results.data(), count);
-            if (status < 0 && count > 1) {
-                // the batch failed as a whole: the chunk degrades to one call per block
-                ++degraded;
-                for (std::size_t i = 0; i < count; ++i) {
-                    m_shared.store->read_blocks(&requests[i], &results[i], 1);
-                }
-            } else if (status < 0 && results[0].status == OV_KVCACHE_OK) {
-                results[0].status = status;
-            }
-            for (std::size_t i = 0; i < count; ++i) {
-                reads[start + i].result = results[i];
-            }
-        }));
+        batches.emplace_back(start, end);
         start = end;
     }
-    for (std::future<void>& batch : done) {
-        batch.get();
+
+    std::size_t degraded = 0;
+    if (!m_shared.store->is_async()) {
+        std::vector<std::uint8_t> batch_degraded(batches.size(), 0);
+        std::vector<std::future<void>> done;
+        for (std::size_t b = 0; b < batches.size(); ++b) {
+            done.push_back(m_io_pool.submit([this, &reads, &batches, &batch_degraded, b] {
+                batch_degraded[b] = read_batch(reads, batches[b].first, batches[b].second) ? 1 : 0;
+            }));
+        }
+        for (std::future<void>& batch : done) {
+            batch.get();
+        }
+        for (std::uint8_t batch : batch_degraded) {
+            degraded += batch;
+        }
+        for (BlockRead& item : reads) {
+            item.failure = verify(state, item);
+        }
+        return degraded;
     }
-    return degraded.load();
+
+    // Every request and result array stays in place, unmodified, until its token is terminal
+    struct Submitted {
+        std::vector<OvKVCacheStoreReadRequest> requests;
+        std::vector<OvKVCacheStoreReadResult> results;
+        OvKVCacheAsyncToken token = 0;
+    };
+    std::vector<Submitted> submitted(batches.size());
+    for (std::size_t b = 0; b < batches.size(); ++b) {
+        const auto [start, end] = batches[b];
+        Submitted& batch = submitted[b];
+        for (std::size_t i = start; i < end; ++i) {
+            batch.requests.push_back(reads[i].request);
+        }
+        batch.results.resize(end - start);
+        // a failed submit leaves the token 0: that batch is read synchronously below
+        m_shared.store->read_blocks_async(batch.requests.data(), batch.results.data(), end - start, batch.token);
+    }
+    bool cancelled = false;
+    for (std::size_t b = 0; b < batches.size(); ++b) {
+        const auto [start, end] = batches[b];
+        Submitted& batch = submitted[b];
+        if (batch.token == 0) {
+            if (cancelled) {
+                for (std::size_t i = start; i < end; ++i) {
+                    reads[i].result.status = OV_KVCACHE_ERR_CANCELLED;
+                }
+            } else {
+                degraded += read_batch(reads, start, end) ? 1 : 0;
+            }
+        } else {
+            OvKVCacheStatus status = OV_KVCACHE_PENDING;
+            while (status == OV_KVCACHE_PENDING) {
+                status = m_shared.store->wait(batch.token, OV_KVCACHE_WAIT_INFINITE);
+            }
+            for (std::size_t i = start; i < end; ++i) {
+                reads[i].result = batch.results[i - start];
+            }
+            if (status < 0 && status != OV_KVCACHE_ERR_CANCELLED) {
+                if (end - start > 1) {
+                    // the batch failed as a whole: the chunk degrades to one call per block
+                    degraded += read_batch(reads, start, end) ? 1 : 0;
+                } else if (reads[start].result.status == OV_KVCACHE_OK) {
+                    reads[start].result.status = status;
+                }
+            }
+        }
+        for (std::size_t i = start; i < end; ++i) {
+            BlockRead& item = reads[i];
+            item.failure = verify(state, item);
+            if (!item.failure.empty() && item.channel == m_kv_channel && !cancelled) {
+                // nothing after a failed KV block can be used: stop the batches that have not started
+                cancelled = true;
+                for (std::size_t later = b + 1; later < batches.size(); ++later) {
+                    if (submitted[later].token != 0) {
+                        m_shared.store->cancel(submitted[later].token);
+                    }
+                }
+            }
+        }
+    }
+    return degraded;
+}
+
+bool CacheStoreTier::read_batch(std::vector<BlockRead>& reads, std::size_t start, std::size_t end) const {
+    const std::size_t count = end - start;
+    std::vector<OvKVCacheStoreReadRequest> requests(count);
+    std::vector<OvKVCacheStoreReadResult> results(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        requests[i] = reads[start + i].request;
+    }
+    const OvKVCacheStatus status = m_shared.store->read_blocks(requests.data(), results.data(), count);
+    const bool degraded = status < 0 && count > 1;
+    if (degraded) {
+        // the batch failed as a whole: the chunk degrades to one call per block
+        for (std::size_t i = 0; i < count; ++i) {
+            m_shared.store->read_blocks(&requests[i], &results[i], 1);
+        }
+    } else if (status < 0 && results[0].status == OV_KVCACHE_OK) {
+        results[0].status = status;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        reads[start + i].result = results[i];
+    }
+    return degraded;
 }
 
 std::string CacheStoreTier::verify(RequestState& state, const BlockRead& item) const {
@@ -415,29 +505,31 @@ void CacheStoreTier::plan_reload(RequestState& state) {
         diagnostics.miss_reason = "the staging pool cannot hold the reload";
         return;
     }
-    diagnostics.degraded_chunks += read(reads);
+    diagnostics.degraded_chunks += fetch(state, reads);
 
-    // Verify: a block that fails is a miss for itself and everything after it
+    // A block that fails verification is a miss for itself and everything after it
     std::size_t verified_blocks = first_block;
     std::string failure;
     for (const BlockRead& item : reads) {
-        diagnostics.store_read_blocks += 1;
-        diagnostics.store_read_bytes += item.result.bytes_read;
+        if (item.result.status == OV_KVCACHE_OK) {
+            diagnostics.store_read_blocks += 1;
+            diagnostics.store_read_bytes += item.result.bytes_read;
+        }
     }
     for (const BlockRead& item : reads) {
         if (item.channel != m_kv_channel) {
             continue;
         }
-        failure = verify(state, item);
-        if (!failure.empty()) {
+        if (!item.failure.empty()) {
             // nothing from here on is trusted: it is written again once recomputed, which repairs the store in one pass
+            failure = item.failure;
             forget_stored_from(state, item.block * block_size);
             break;
         }
         ++verified_blocks;
     }
     if (m_la_channel) {
-        const std::string la_failure = verify(state, reads.back());
+        const std::string& la_failure = reads.back().failure;
         if (!la_failure.empty()) {
             // the blocks before it verified; checkpoints from this one on are written again
             for (auto it = state.checkpoint_writes.lower_bound(position); it != state.checkpoint_writes.end(); ++it) {
@@ -699,64 +791,85 @@ void CacheStoreTier::write_complete_blocks(RequestState& state, bool within_budg
         diagnostics.pushed_blocks += transfers->size();
         diagnostics.pushed_bytes += transfers->size() * batch->channel->block_bytes;
         m_io_pool.submit([this, batch] {
-            run_write_batch(*batch);
+            run_write_batch(batch);
         });
     }
 }
 
-void CacheStoreTier::run_write_batch(WriteBatch& batch) {
-    const StoreChannel& channel = *batch.channel;
+void CacheStoreTier::run_write_batch(const std::shared_ptr<WriteBatch>& batch) {
+    const StoreChannel& channel = *batch->channel;
     // A block the reload never probed (e.g. of generated tokens) is written only if the store does not hold its key
-    std::vector<bool> skipped(batch.blocks.size(), false);
+    std::vector<bool> skipped(batch->blocks.size(), false);
     std::vector<std::size_t> unknown;
     std::vector<OvKVCacheBlockKey> unknown_keys;
-    for (std::size_t i = 0; i < batch.blocks.size(); ++i) {
-        if (batch.blocks[i].if_absent) {
+    for (std::size_t i = 0; i < batch->blocks.size(); ++i) {
+        if (batch->blocks[i].if_absent) {
             unknown.push_back(i);
-            unknown_keys.push_back(batch.blocks[i].key);
+            unknown_keys.push_back(batch->blocks[i].key);
         }
     }
-    if (!unknown.empty() && batch.store->can_probe()) {
+    if (!unknown.empty() && batch->store->can_probe()) {
         std::vector<std::uint8_t> present(unknown.size(), 0);
-        if (batch.store->has_blocks(unknown_keys.data(), present.data(), unknown_keys.size()) == OV_KVCACHE_OK) {
+        if (batch->store->has_blocks(unknown_keys.data(), present.data(), unknown_keys.size()) == OV_KVCACHE_OK) {
             for (std::size_t j = 0; j < unknown.size(); ++j) {
                 skipped[unknown[j]] = present[j] == 1;
             }
         }
     }
 
-    std::vector<std::array<std::uint8_t, WitnessRecord::SIZE>> witnesses;
-    std::vector<OvKVCacheStoreWriteRequest> requests;
-    witnesses.reserve(batch.blocks.size());  // requests point into it
-    requests.reserve(batch.blocks.size());
-    for (std::size_t i = 0; i < batch.blocks.size(); ++i) {
+    auto write = std::make_unique<InflightWrite>();
+    write->witnesses.reserve(batch->blocks.size());  // requests point into it
+    write->requests.reserve(batch->blocks.size());
+    for (std::size_t i = 0; i < batch->blocks.size(); ++i) {
         if (skipped[i]) {
             continue;
         }
-        const BlockWrite& block = batch.blocks[i];
+        const BlockWrite& block = batch->blocks[i];
         WitnessRecord record;
-        record.expires_at = batch.expires_at;
+        record.expires_at = batch->expires_at;
         if (m_config.verify_payload_crc) {
             record.flags |= WitnessRecord::FLAG_PAYLOAD_CRC;
             record.payload_crc = crc32c(block.payload.data(), channel.block_bytes);
         }
-        record.digest = compute_witness_digest(m_witness_key, batch.root, channel.group, block.end_position,
+        record.digest = compute_witness_digest(m_witness_key, batch->root, channel.group, block.end_position,
                                                block.witness_chain, record);
-        witnesses.push_back(record.encode());
+        write->witnesses.push_back(record.encode());
         OvKVCacheStoreWriteRequest request{};
         request.key = block.key;
         request.source = block.payload.data();
         request.bytes = channel.block_bytes;
-        request.witness = {witnesses.back().data(), witnesses.back().size()};
-        requests.push_back(request);
+        request.witness = {write->witnesses.back().data(), write->witnesses.back().size()};
+        write->requests.push_back(request);
     }
-    const std::size_t count = requests.size();
+    const std::size_t count = write->requests.size();
     if (count == 0) {
         return;
     }
+    write->results.resize(count);
 
-    std::vector<OvKVCacheStoreWriteResult> results(count);
-    OvKVCacheStatus status = batch.store->write_blocks(requests.data(), results.data(), count);
+    if (batch->store->is_async()) {
+        write->batch = batch;
+        batch->store->write_blocks_async(write->requests.data(), write->results.data(), count, write->token);
+        if (write->token != 0) {
+            std::lock_guard<std::mutex> lock(m_inflight_mutex);
+            if (!m_completion_thread.joinable()) {
+                m_completion_thread = std::thread(&CacheStoreTier::complete_writes, this);
+            }
+            m_inflight_writes.push_back(std::move(write));
+            m_inflight_added.notify_one();
+            return;
+        }
+        // the submit failed: the batch is written synchronously instead
+    }
+    const OvKVCacheStatus status = batch->store->write_blocks(write->requests.data(), write->results.data(), count);
+    finish_write(*batch, write->requests, write->results, status);
+}
+
+void CacheStoreTier::finish_write(const WriteBatch& batch,
+                                  const std::vector<OvKVCacheStoreWriteRequest>& requests,
+                                  std::vector<OvKVCacheStoreWriteResult>& results,
+                                  OvKVCacheStatus status) {
+    const std::size_t count = requests.size();
     if (status < 0 && count > 1) {
         // the batch failed as a whole: the chunk degrades to one call per block
         for (std::size_t i = 0; i < count; ++i) {
@@ -778,12 +891,36 @@ void CacheStoreTier::run_write_batch(WriteBatch& batch) {
         m_failed_writes += failed;
         if (!m_reported_write_failure.exchange(true)) {
             GENAI_WARN("Cache store: writing " + std::to_string(failed) + " of " + std::to_string(count) + " '" +
-                       channel.group + "' blocks failed (" + status_to_string(first_failure) +
+                       batch.channel->group + "' blocks failed (" + status_to_string(first_failure) +
                        "); they stay recomputable. Further failures are only counted.");
         }
     }
     if (m_config.durability == CacheStoreConfig::Durability::Strict) {
         batch.store->flush();
+    }
+}
+
+void CacheStoreTier::complete_writes() {
+    while (true) {
+        std::unique_ptr<InflightWrite> write;
+        {
+            std::unique_lock<std::mutex> lock(m_inflight_mutex);
+            m_inflight_added.wait(lock, [this] {
+                return m_stop_completion || !m_inflight_writes.empty();
+            });
+            if (m_inflight_writes.empty()) {
+                return;  // stopping, and every submitted batch is terminal
+            }
+            write = std::move(m_inflight_writes.front());
+            m_inflight_writes.pop_front();
+        }
+        // no host lock is held while waiting (guide section 9)
+        OvKVCacheStatus status = OV_KVCACHE_PENDING;
+        while (status == OV_KVCACHE_PENDING) {
+            status = write->batch->store->wait(write->token, OV_KVCACHE_WAIT_INFINITE);
+        }
+        finish_write(*write->batch, write->requests, write->results, status);
+        // releasing `write` returns the batch's staging leases, now that the plugin no longer touches them
     }
 }
 
