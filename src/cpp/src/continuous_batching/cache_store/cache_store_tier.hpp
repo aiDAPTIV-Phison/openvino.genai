@@ -128,6 +128,9 @@ private:
 
         SequenceGroup::Ptr group;
         SequenceIdentity identity;
+        // I6: a session request reads its session namespace, then the shared one, and writes to its session namespace
+        std::vector<const OpenNamespace*> read_namespaces;
+        const OpenNamespace* write_namespace = nullptr;
         WriteMode write_mode = WriteMode::None;
         // Immediate: next block to write; blocks before it are in the store or came from it
         std::size_t write_cursor = 0;
@@ -143,6 +146,7 @@ private:
     /// One block to read and where it goes.
     struct BlockRead {
         const StoreChannel* channel = nullptr;
+        const OpenNamespace* ns = nullptr;  // where the probe found it
         std::size_t block = 0;  // KV block index the item ends with
         StagingLease payload;
         std::array<std::uint8_t, 2 * WitnessRecord::SIZE> witness{};
@@ -172,6 +176,7 @@ private:
     /// A block a finished `on_evict` request left in the device prefix cache: what its write needs once it is evicted.
     struct WriteBack {
         const StoreChannel* channel = nullptr;
+        const OpenNamespace* ns = nullptr;  // where the block is written
         OvKVCacheContentHash key{0, 0};
         std::size_t end_position = 0;
         Digest128 witness_chain{0, 0};
@@ -197,6 +202,10 @@ private:
 
     /// Opens the namespace of a scope; when the provider fails, falls back to the built-in "file" provider for good.
     bool open_namespace(const std::string& scope, OpenNamespace& opened);
+
+    /// @return The namespace of a session scope, opened on first use (a provider call outside every lock), or nullptr
+    /// when the provider cannot open it (@p error says why).
+    const OpenNamespace* session_namespace(const std::string& scope, std::string& error);
 
     /// @return How the request's blocks are written, from the engine trigger and the request's policy.
     WriteMode write_mode_of(const PromptCachePolicy& policy) const;
@@ -230,8 +239,19 @@ private:
     /// channel can serve, reads it into staging and verifies it.
     void plan_reload(RequestState& state);
 
-    /// Probes the keys of @p blocks of a channel (each KV block index the item ends with); true = present.
-    std::vector<bool> probe(RequestState& state, const StoreChannel& channel, const std::vector<std::size_t>& blocks);
+    /// Probes the keys of @p blocks of a channel (each KV block index the item ends with) in one namespace.
+    /// @return true = present. A failed probe counts as absent and sets @p failure.
+    std::vector<bool> probe(RequestState& state,
+                            const OpenNamespace& ns,
+                            const StoreChannel& channel,
+                            const std::vector<std::size_t>& blocks,
+                            std::string& failure);
+
+    /// @return For each of @p blocks, the first of the request's read namespaces that holds it, or nullptr.
+    std::vector<const OpenNamespace*> locate(RequestState& state,
+                                             const StoreChannel& channel,
+                                             const std::vector<std::size_t>& blocks,
+                                             std::string& failure);
 
     /// Fetches the items in batches of consecutive blocks of one channel and verifies each (sets `failure`). A
     /// synchronous store reads the batches in parallel on the I/O pool. An asynchronous store gets every batch submitted
@@ -274,6 +294,10 @@ private:
     StoreFingerprints m_fingerprints;
     std::shared_ptr<StoreProvider> m_provider;
     OpenNamespace m_shared;
+    // session scopes (I6), by scope key; entries are never removed, so their addresses stay valid
+    std::mutex m_sessions_mutex;
+    std::map<std::string, std::unique_ptr<OpenNamespace>> m_sessions;
+    std::atomic<bool> m_reported_session_failure{false};
     SipHash128::Key m_witness_key{};
     StagingPool m_staging;
     BlockCodec m_codec;

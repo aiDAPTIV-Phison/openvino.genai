@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <future>
 #include <optional>
+#include <tuple>
 
 #include "continuous_batching/cache/cache_orchestrator.hpp"
 #include "continuous_batching/cache/kv_cache_manager.hpp"
@@ -139,10 +140,17 @@ CacheStoreTier::~CacheStoreTier() {
     if (m_completion_thread.joinable()) {
         m_completion_thread.join();
     }
-    if (m_shared.store) {
-        const OvKVCacheStatus status = m_shared.store->flush();
+    std::vector<const OpenNamespace*> namespaces{&m_shared};
+    for (const auto& [scope, session] : m_sessions) {
+        namespaces.push_back(session.get());
+    }
+    for (const OpenNamespace* ns : namespaces) {
+        if (!ns->store) {
+            continue;
+        }
+        const OvKVCacheStatus status = ns->store->flush();
         if (status != OV_KVCACHE_OK) {
-            GENAI_WARN("Cache store flush failed: " + status_to_string(status));
+            GENAI_WARN("Cache store flush of namespace '" + ns->scope + "' failed: " + status_to_string(status));
         }
     }
     const std::size_t failed_writes = m_failed_writes.load();
@@ -173,6 +181,32 @@ bool CacheStoreTier::open_namespace(const std::string& scope, OpenNamespace& ope
     return true;
 }
 
+const CacheStoreTier::OpenNamespace* CacheStoreTier::session_namespace(const std::string& scope, std::string& error) {
+    {
+        std::lock_guard<std::mutex> lock(m_sessions_mutex);
+        const auto it = m_sessions.find(scope);
+        if (it != m_sessions.end()) {
+            return it->second.get();
+        }
+    }
+    // Opened outside the lock; two requests opening the same new session get the provider's shared instance
+    auto opened = std::make_unique<OpenNamespace>();
+    opened->scope = scope;
+    opened->bytes = make_namespace(scope, m_fingerprints);
+    const StoreProvider::OpenedStore store = m_provider->open(opened->bytes, m_config, error);
+    if (!store.store) {
+        return nullptr;
+    }
+    opened->store = store.store;
+    opened->root = chain_root(opened->bytes, store);
+    std::lock_guard<std::mutex> lock(m_sessions_mutex);
+    std::unique_ptr<OpenNamespace>& entry = m_sessions[scope];
+    if (!entry) {
+        entry = std::move(opened);
+    }
+    return entry.get();
+}
+
 void CacheStoreTier::on_add_request(const SequenceGroup::Ptr& group) {
     CacheDiagnostics& diagnostics = group->get_cache_diagnostics();
     const GenerationConfig& sampling_params = group->get_sampling_parameters();
@@ -183,7 +217,26 @@ void CacheStoreTier::on_add_request(const SequenceGroup::Ptr& group) {
 
     const std::size_t block_size = m_kv_channel->block_size_tokens;
     auto state = std::make_unique<RequestState>(group, block_size, m_witness_key);
-    state->write_mode = write_mode_of(sampling_params.prompt_cache);
+    const PromptCachePolicy& policy = sampling_params.prompt_cache;
+    state->read_namespaces = {&m_shared};
+    state->write_namespace = &m_shared;
+    if (policy.is_session_scoped()) {
+        std::string error;
+        const std::string scope = scope_key(policy.scope);
+        if (const OpenNamespace* session = session_namespace(scope, error)) {
+            state->read_namespaces.insert(state->read_namespaces.begin(), session);
+            state->write_namespace = session;
+        } else {
+            // a session's blocks never go to the shared namespace: the request only reads shared blocks
+            state->write_namespace = nullptr;
+            if (!m_reported_session_failure.exchange(true)) {
+                GENAI_WARN("Cache store: the namespace of '" + scope + "' cannot be opened (" + error +
+                           "); session requests read the shared namespace and write nothing. Further failures are not "
+                           "reported.");
+            }
+        }
+    }
+    state->write_mode = state->write_namespace ? write_mode_of(policy) : WriteMode::None;
     // A block the device cache supplied is never written again, even when its last token is recomputed: that rewrites
     // the block's quantization data, so its bytes would differ from the ones already stored under the same key
     state->write_cursor = (group->get_num_processed_tokens() + block_size - 1) / block_size;
@@ -214,29 +267,67 @@ CacheStoreTier::WriteMode CacheStoreTier::write_mode_of(const PromptCachePolicy&
 }
 
 std::vector<bool> CacheStoreTier::probe(RequestState& state,
+                                        const OpenNamespace& ns,
                                         const StoreChannel& channel,
-                                        const std::vector<std::size_t>& blocks) {
+                                        const std::vector<std::size_t>& blocks,
+                                        std::string& failure) {
     std::vector<bool> present(blocks.size(), true);
-    if (blocks.empty() || !m_shared.store->can_probe()) {
+    if (blocks.empty() || !ns.store->can_probe()) {
         return present;  // without a probe every candidate is a candidate for the fetch, which verifies it
     }
     std::vector<OvKVCacheBlockKey> keys;
     keys.reserve(blocks.size());
     for (std::size_t block : blocks) {
-        keys.push_back(make_key(channel, state.identity.key(m_shared.root, block, channel.group)));
+        keys.push_back(make_key(channel, state.identity.key(ns.root, block, channel.group)));
     }
     std::vector<std::uint8_t> out_present(blocks.size(), 0);
     OvKVCacheStatus status = OV_KVCACHE_OK;
     m_io_pool
         .submit([&] {
-            status = m_shared.store->has_blocks(keys.data(), out_present.data(), keys.size());
+            status = ns.store->has_blocks(keys.data(), out_present.data(), keys.size());
         })
         .get();
     state.group->get_cache_diagnostics().store_probed_keys += keys.size();
+    if (status != OV_KVCACHE_OK && failure.empty()) {
+        failure = "has_blocks returned " + status_to_string(status);
+    }
     for (std::size_t i = 0; i < blocks.size(); ++i) {
         present[i] = status == OV_KVCACHE_OK && out_present[i] == 1;
     }
     return present;
+}
+
+std::vector<const CacheStoreTier::OpenNamespace*> CacheStoreTier::locate(RequestState& state,
+                                                                        const StoreChannel& channel,
+                                                                        const std::vector<std::size_t>& blocks,
+                                                                        std::string& failure) {
+    std::vector<const OpenNamespace*> found(blocks.size(), nullptr);
+    std::vector<std::size_t> missing(blocks.size());
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        missing[i] = i;
+    }
+    // in the request's order of preference: its session namespace, then the shared one (I6)
+    for (const OpenNamespace* ns : state.read_namespaces) {
+        if (missing.empty()) {
+            break;
+        }
+        std::vector<std::size_t> query;
+        query.reserve(missing.size());
+        for (std::size_t i : missing) {
+            query.push_back(blocks[i]);
+        }
+        const std::vector<bool> present = probe(state, *ns, channel, query, failure);
+        std::vector<std::size_t> still_missing;
+        for (std::size_t j = 0; j < missing.size(); ++j) {
+            if (present[j]) {
+                found[missing[j]] = ns;
+            } else {
+                still_missing.push_back(missing[j]);
+            }
+        }
+        missing.swap(still_missing);
+    }
+    return found;
 }
 
 std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& reads) {
@@ -247,12 +338,13 @@ std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& r
         item.request.target.bytes = item.channel->block_bytes;
         item.request.witness_out = {item.witness.data(), item.witness.size()};
     }
-    // batches of consecutive items of one channel, one per I/O thread
+    // batches of consecutive items of one channel and namespace, one per I/O thread
     const std::size_t batch_size = std::max<std::size_t>(1, (reads.size() + m_config.io_threads - 1) / m_config.io_threads);
     std::vector<std::pair<std::size_t, std::size_t>> batches;
     for (std::size_t start = 0; start < reads.size();) {
         std::size_t end = start + 1;
-        while (end < reads.size() && end - start < batch_size && reads[end].channel == reads[start].channel) {
+        while (end < reads.size() && end - start < batch_size && reads[end].channel == reads[start].channel &&
+               reads[end].ns == reads[start].ns) {
             ++end;
         }
         batches.emplace_back(start, end);
@@ -260,7 +352,10 @@ std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& r
     }
 
     std::size_t degraded = 0;
-    if (!m_shared.store->is_async()) {
+    const bool is_async = std::all_of(reads.begin(), reads.end(), [](const BlockRead& item) {
+        return item.ns->store->is_async();
+    });
+    if (!is_async) {
         std::vector<std::uint8_t> batch_degraded(batches.size(), 0);
         std::vector<std::future<void>> done;
         for (std::size_t b = 0; b < batches.size(); ++b) {
@@ -282,6 +377,7 @@ std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& r
 
     // Every request and result array stays in place, unmodified, until its token is terminal
     struct Submitted {
+        std::shared_ptr<StoreInstance> store;
         std::vector<OvKVCacheStoreReadRequest> requests;
         std::vector<OvKVCacheStoreReadResult> results;
         OvKVCacheAsyncToken token = 0;
@@ -290,12 +386,13 @@ std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& r
     for (std::size_t b = 0; b < batches.size(); ++b) {
         const auto [start, end] = batches[b];
         Submitted& batch = submitted[b];
+        batch.store = reads[start].ns->store;
         for (std::size_t i = start; i < end; ++i) {
             batch.requests.push_back(reads[i].request);
         }
         batch.results.resize(end - start);
         // a failed submit leaves the token 0: that batch is read synchronously below
-        m_shared.store->read_blocks_async(batch.requests.data(), batch.results.data(), end - start, batch.token);
+        batch.store->read_blocks_async(batch.requests.data(), batch.results.data(), end - start, batch.token);
     }
     bool cancelled = false;
     for (std::size_t b = 0; b < batches.size(); ++b) {
@@ -312,7 +409,7 @@ std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& r
         } else {
             OvKVCacheStatus status = OV_KVCACHE_PENDING;
             while (status == OV_KVCACHE_PENDING) {
-                status = m_shared.store->wait(batch.token, OV_KVCACHE_WAIT_INFINITE);
+                status = batch.store->wait(batch.token, OV_KVCACHE_WAIT_INFINITE);
             }
             for (std::size_t i = start; i < end; ++i) {
                 reads[i].result = batch.results[i - start];
@@ -334,7 +431,7 @@ std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& r
                 cancelled = true;
                 for (std::size_t later = b + 1; later < batches.size(); ++later) {
                     if (submitted[later].token != 0) {
-                        m_shared.store->cancel(submitted[later].token);
+                        submitted[later].store->cancel(submitted[later].token);
                     }
                 }
             }
@@ -350,12 +447,13 @@ bool CacheStoreTier::read_batch(std::vector<BlockRead>& reads, std::size_t start
     for (std::size_t i = 0; i < count; ++i) {
         requests[i] = reads[start + i].request;
     }
-    const OvKVCacheStatus status = m_shared.store->read_blocks(requests.data(), results.data(), count);
+    const std::shared_ptr<StoreInstance>& store = reads[start].ns->store;
+    const OvKVCacheStatus status = store->read_blocks(requests.data(), results.data(), count);
     const bool degraded = status < 0 && count > 1;
     if (degraded) {
         // the batch failed as a whole: the chunk degrades to one call per block
         for (std::size_t i = 0; i < count; ++i) {
-            m_shared.store->read_blocks(&requests[i], &results[i], 1);
+            store->read_blocks(&requests[i], &results[i], 1);
         }
     } else if (status < 0 && results[0].status == OV_KVCACHE_OK) {
         results[0].status = status;
@@ -378,7 +476,7 @@ std::string CacheStoreTier::verify(RequestState& state, const BlockRead& item) c
     if (result.witness.data != item.witness.data() || !WitnessRecord::decode(item.witness.data(), result.witness.len, record)) {
         return "malformed witness";
     }
-    const Digest128 expected = compute_witness_digest(m_witness_key, m_shared.root, item.channel->group,
+    const Digest128 expected = compute_witness_digest(m_witness_key, item.ns->root, item.channel->group,
                                                       (item.block + 1) * m_kv_channel->block_size_tokens,
                                                       state.identity.witness_chain(item.block), record);
     if (expected != record.digest) {
@@ -432,7 +530,10 @@ void CacheStoreTier::plan_reload(RequestState& state) {
     // Bounded fixpoint over the channels (guide section 14.4): a paged channel reaches the end of the run of present
     // blocks, a whole-state channel the largest present checkpoint; the common position is their minimum
     std::vector<int> kv_present(num_complete, -1);
+    std::vector<const OpenNamespace*> kv_source(num_complete, nullptr);  // the namespace a present block is read from
     std::map<std::size_t, bool> la_present;
+    std::map<std::size_t, const OpenNamespace*> la_source;
+    std::string probe_failure;
     std::size_t position = max_position;
     for (std::size_t round = 1; round <= MAX_RECONCILE_ROUNDS; ++round) {
         diagnostics.store_probe_rounds = round;
@@ -443,9 +544,10 @@ void CacheStoreTier::plan_reload(RequestState& state) {
                 unknown.push_back(block);
             }
         }
-        const std::vector<bool> kv_found = probe(state, *m_kv_channel, unknown);
+        const std::vector<const OpenNamespace*> kv_found = locate(state, *m_kv_channel, unknown, probe_failure);
         for (std::size_t i = 0; i < unknown.size(); ++i) {
             kv_present[unknown[i]] = kv_found[i] ? 1 : 0;
+            kv_source[unknown[i]] = kv_found[i];
         }
         std::size_t reach = first_block;
         while (reach < needed_blocks && kv_present[reach] == 1) {
@@ -470,9 +572,11 @@ void CacheStoreTier::plan_reload(RequestState& state) {
             for (std::size_t checkpoint : unknown_checkpoints) {
                 checkpoint_blocks.push_back(checkpoint / block_size - 1);
             }
-            const std::vector<bool> la_found = probe(state, *m_la_channel, checkpoint_blocks);
+            const std::vector<const OpenNamespace*> la_found =
+                locate(state, *m_la_channel, checkpoint_blocks, probe_failure);
             for (std::size_t i = 0; i < unknown_checkpoints.size(); ++i) {
-                la_present[unknown_checkpoints[i]] = la_found[i];
+                la_present[unknown_checkpoints[i]] = la_found[i] != nullptr;
+                la_source[unknown_checkpoints[i]] = la_found[i];
             }
             std::size_t best = device_tokens;
             for (std::size_t checkpoint = candidate / interval * interval; checkpoint > device_tokens; checkpoint -= interval) {
@@ -500,35 +604,37 @@ void CacheStoreTier::plan_reload(RequestState& state) {
         state.checkpoint_writes[checkpoint] = present ? StoreWrite::Never : StoreWrite::Always;
     }
     if (position <= device_tokens) {
-        diagnostics.miss_reason = "not in the store";
+        diagnostics.miss_reason = probe_failure.empty() ? "not in the store" : "the store is unavailable: " + probe_failure;
         return;
     }
 
-    // Fetch into staging
+    // Fetch into staging, each block from the namespace its probe found it in
     const std::size_t num_blocks = (position + block_size - 1) / block_size;
     std::vector<BlockRead> reads;
     reads.reserve(num_blocks - first_block + 1);
     for (std::size_t block = first_block; block < num_blocks; ++block) {
         BlockRead item;
         item.channel = m_kv_channel;
+        item.ns = kv_source[block];
         item.block = block;
         item.payload = m_staging.try_acquire(m_kv_channel->block_bytes);
         if (!item.payload) {
             break;
         }
-        item.request.key.hash = state.identity.key(m_shared.root, block, m_kv_channel->group);
+        item.request.key.hash = state.identity.key(item.ns->root, block, m_kv_channel->group);
         reads.push_back(std::move(item));
     }
     if (m_la_channel) {
         BlockRead item;
         item.channel = m_la_channel;
+        item.ns = la_source.at(position);
         item.block = position / block_size - 1;
         item.payload = m_staging.try_acquire(m_la_channel->block_bytes);
         if (reads.size() < num_blocks - first_block || !item.payload) {
             diagnostics.miss_reason = "the staging pool cannot hold the reload";
             return;
         }
-        item.request.key.hash = state.identity.key(m_shared.root, item.block, m_la_channel->group);
+        item.request.key.hash = state.identity.key(item.ns->root, item.block, m_la_channel->group);
         reads.push_back(std::move(item));
     } else if (reads.empty()) {
         diagnostics.miss_reason = "the staging pool cannot hold the reload";
@@ -793,9 +899,10 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
                                          std::size_t first_block,
                                          std::size_t end_block,
                                          bool within_budget) {
-    if (first_block >= end_block) {
+    if (first_block >= end_block || !state.write_namespace) {
         return first_block;
     }
+    const OpenNamespace& ns = *state.write_namespace;
     const SequenceGroup& group = *state.group;
     const Sequence::CPtr sequence = group[0];
     const std::uint64_t seq_id = sequence->get_id();
@@ -807,9 +914,9 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
     const std::uint64_t expires_at = policy.ttl.is_unlimited() ? 0 : unix_seconds_now() + policy.ttl.get_seconds();
     const auto make_batch = [&](const StoreChannel* channel) {
         auto batch = std::make_shared<WriteBatch>();
-        batch->store = m_shared.store;
+        batch->store = ns.store;
         batch->channel = channel;
-        batch->root = m_shared.root;
+        batch->root = ns.root;
         batch->expires_at = expires_at;
         return batch;
     };
@@ -855,7 +962,7 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
         if (write_kv) {
             kv_transfers.push_back({static_cast<std::size_t>(kv_block_tables[0][block]->get_index()), kv_payload.data()});
             kv_batch->blocks.push_back({std::move(kv_payload),
-                                        make_key(*m_kv_channel, state.identity.key(m_shared.root, block, m_kv_channel->group)),
+                                        make_key(*m_kv_channel, state.identity.key(ns.root, block, m_kv_channel->group)),
                                         end_position,
                                         state.identity.witness_chain(block),
                                         kv_write == StoreWrite::IfAbsent});
@@ -863,7 +970,7 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
         if (la_row) {
             la_transfers.push_back({*la_row, la_payload.data()});
             la_batch->blocks.push_back({std::move(la_payload),
-                                        make_key(*m_la_channel, state.identity.key(m_shared.root, block, m_la_channel->group)),
+                                        make_key(*m_la_channel, state.identity.key(ns.root, block, m_la_channel->group)),
                                         end_position,
                                         state.identity.witness_chain(block),
                                         la_write == StoreWrite::IfAbsent});
@@ -897,9 +1004,10 @@ void CacheStoreTier::remember_for_write_back(RequestState& state) {
     const std::size_t block_size = m_kv_channel->block_size_tokens;
     const BlocksPerLayer& kv_table = m_orchestrator->get_kv_block_tables(seq_id)[0];
     const std::size_t num_complete = std::min(group.get_num_processed_tokens() / block_size, kv_table.size());
-    if (num_complete == 0) {
+    if (num_complete == 0 || !state.write_namespace) {
         return;
     }
+    const OpenNamespace* ns = state.write_namespace;
     state.identity.extend(group, *sequence, num_complete);
     const PromptCachePolicy& policy = group.get_sampling_parameters().prompt_cache;
     const std::uint64_t ttl_seconds = policy.ttl.is_unlimited() ? 0 : policy.ttl.get_seconds();
@@ -912,7 +1020,8 @@ void CacheStoreTier::remember_for_write_back(RequestState& state) {
         if (kv_write != StoreWrite::Never) {
             blocks.push_back({{CacheType::KV_CACHE, kv_table[block]->get_hash()},
                               WriteBack{m_kv_channel,
-                                        state.identity.key(m_shared.root, block, m_kv_channel->group),
+                                        ns,
+                                        state.identity.key(ns->root, block, m_kv_channel->group),
                                         end_position,
                                         state.identity.witness_chain(block),
                                         ttl_seconds,
@@ -929,7 +1038,8 @@ void CacheStoreTier::remember_for_write_back(RequestState& state) {
         if (la_write != StoreWrite::Never && la_position >= la_start && la_position - la_start < la_table.size()) {
             blocks.push_back({{CacheType::LINEAR_ATTENTION_CACHE, la_table[la_position - la_start]->get_hash()},
                               WriteBack{m_la_channel,
-                                        state.identity.key(m_shared.root, block, m_la_channel->group),
+                                        ns,
+                                        state.identity.key(ns->root, block, m_la_channel->group),
                                         end_position,
                                         state.identity.witness_chain(block),
                                         ttl_seconds,
@@ -943,12 +1053,12 @@ void CacheStoreTier::remember_for_write_back(RequestState& state) {
 }
 
 std::vector<bool> CacheStoreTier::write_back(const std::vector<std::pair<WriteBack, std::size_t>>& blocks) {
-    // one batch per channel and expiry
+    // one batch per channel, expiry and namespace
     struct Pending {
         std::shared_ptr<WriteBatch> batch;
         std::vector<BlockTransfer> transfers;
     };
-    std::map<std::pair<const StoreChannel*, std::uint64_t>, Pending> batches;
+    std::map<std::tuple<const StoreChannel*, std::uint64_t, const OpenNamespace*>, Pending> batches;
     std::vector<bool> queued(blocks.size(), false);
     const std::uint64_t now = unix_seconds_now();
     for (std::size_t i = 0; i < blocks.size(); ++i) {
@@ -958,12 +1068,12 @@ std::vector<bool> CacheStoreTier::write_back(const std::vector<std::pair<WriteBa
             continue;
         }
         const std::uint64_t expires_at = block.ttl_seconds == 0 ? 0 : now + block.ttl_seconds;
-        Pending& pending = batches[{block.channel, expires_at}];
+        Pending& pending = batches[{block.channel, expires_at, block.ns}];
         if (!pending.batch) {
             pending.batch = std::make_shared<WriteBatch>();
-            pending.batch->store = m_shared.store;
+            pending.batch->store = block.ns->store;
             pending.batch->channel = block.channel;
-            pending.batch->root = m_shared.root;
+            pending.batch->root = block.ns->root;
             pending.batch->expires_at = expires_at;
         }
         pending.transfers.push_back({block_index, payload.data()});
