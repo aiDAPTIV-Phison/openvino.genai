@@ -1,6 +1,7 @@
 // Copyright (C) 2023-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <memory>
@@ -568,6 +569,59 @@ void ContinuousBatchingPipeline::step() {
 
 bool ContinuousBatchingPipeline::has_non_finished_requests() {
     return m_impl->has_non_finished_requests();
+}
+
+namespace {
+
+/// Runs pipeline steps until @p outcome is ready or nothing is left to run, then waits for it: the last writes of a push
+/// complete on the cache store's threads after its request has finished.
+template <typename Outcome, typename Pipeline>
+Outcome run_steps_until_ready(std::future<Outcome> outcome, Pipeline& pipeline) {
+    while (outcome.wait_for(std::chrono::seconds(0)) != std::future_status::ready &&
+           pipeline.has_non_finished_requests()) {
+        pipeline.step();
+    }
+    return outcome.get();
+}
+
+}  // namespace
+
+PushCacheOutcome ContinuousBatchingPipeline::push_cache(const ov::Tensor& input_ids, const PromptCachePolicy& policy) {
+    return run_steps_until_ready(push_cache_async(input_ids, policy), *this);
+}
+
+PushCacheOutcome ContinuousBatchingPipeline::push_cache(const std::string& prompt, const PromptCachePolicy& policy) {
+    return run_steps_until_ready(push_cache_async(prompt, policy), *this);
+}
+
+std::future<PushCacheOutcome> ContinuousBatchingPipeline::push_cache_async(const ov::Tensor& input_ids,
+                                                                           const PromptCachePolicy& policy) {
+    return m_impl->push_cache_async(input_ids, policy);
+}
+
+std::future<PushCacheOutcome> ContinuousBatchingPipeline::push_cache_async(const std::string& prompt,
+                                                                           const PromptCachePolicy& policy) {
+    return m_impl->push_cache_async(prompt, policy);
+}
+
+PrefetchCacheOutcome ContinuousBatchingPipeline::prefetch_cache(const ov::Tensor& input_ids,
+                                                                const PromptCachePolicy& policy) {
+    return run_steps_until_ready(prefetch_cache_async(input_ids, policy), *this);
+}
+
+PrefetchCacheOutcome ContinuousBatchingPipeline::prefetch_cache(const std::string& prompt,
+                                                                const PromptCachePolicy& policy) {
+    return run_steps_until_ready(prefetch_cache_async(prompt, policy), *this);
+}
+
+std::future<PrefetchCacheOutcome> ContinuousBatchingPipeline::prefetch_cache_async(const ov::Tensor& input_ids,
+                                                                                   const PromptCachePolicy& policy) {
+    return m_impl->prefetch_cache_async(input_ids, policy);
+}
+
+std::future<PrefetchCacheOutcome> ContinuousBatchingPipeline::prefetch_cache_async(const std::string& prompt,
+                                                                                   const PromptCachePolicy& policy) {
+    return m_impl->prefetch_cache_async(prompt, policy);
 }
 
 std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::generate(const std::vector<ov::Tensor>& input_ids, const std::vector<ov::genai::GenerationConfig>& sampling_params, const StreamerVariant& streamer) {

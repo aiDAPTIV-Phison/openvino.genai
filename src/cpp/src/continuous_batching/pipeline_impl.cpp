@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <optional>
 #include <thread>
 
@@ -59,6 +60,26 @@ size_t get_available_cpu_memory() {
 #endif
     return std::numeric_limits<size_t>::max();
 }
+
+}  // namespace
+
+namespace {
+
+/// @return The first @p count tokens of a [1, tokens, ...] (or [tokens]) tensor, as a new tensor.
+ov::Tensor first_tokens(const ov::Tensor& tensor, size_t count) {
+    ov::Shape shape = tensor.get_shape();
+    const size_t token_axis = shape.size() > 1 ? 1 : 0;
+    OPENVINO_ASSERT(shape.size() == 1 || shape[0] == 1, "Expected a single-sequence tensor");
+    OPENVINO_ASSERT(count <= shape[token_axis], "Cannot keep more tokens than the tensor has");
+    shape[token_axis] = count;
+    ov::Tensor result(tensor.get_element_type(), shape);
+    // the kept tokens are the leading rows of the contiguous tensor
+    std::memcpy(result.data(), tensor.data(), result.get_byte_size());
+    return result;
+}
+
+// Request ids of push_cache / prefetch_cache requests, far above the ones applications and generate() use
+constexpr uint64_t CACHE_REQUEST_ID_BASE = uint64_t{1} << 63;
 
 }  // namespace
 
@@ -317,23 +338,32 @@ GenerationHandle ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request
     OPENVINO_ASSERT(sampling_params_copy.max_length > prompt_len,
                     "'max_length' must be greater than the number of prompt tokens");
 
-    std::shared_ptr<SequenceGroup> sequence_group;
-    if (m_model_input_type == ModelInputType::EMBEDDINGS) {
-        const auto [position_ids, rope_delta] = m_inputs_embedder->get_position_ids(input_ids.get_shape()[1], 0);
-        sequence_group = std::make_shared<SequenceGroup>(request_id,
-                                                         input_ids,
-                                                         sampling_params_copy,
-                                                         token_type_ids,
-                                                         lm_extra_inputs,
-                                                         position_ids,
-                                                         rope_delta,
-                                                         prompt_ids);
-    }
-    else {
-        sequence_group = std::make_shared<SequenceGroup>(request_id,
-                                                         input_ids,
-                                                         sampling_params_copy,
-                                                         token_type_ids);
+    const auto make_sequence_group = [&](const ov::Tensor& inputs,
+                                         const std::optional<ov::Tensor>& type_ids,
+                                         const std::optional<ov::Tensor>& ids_of_prompt) {
+        if (m_model_input_type == ModelInputType::EMBEDDINGS) {
+            const auto [position_ids, rope_delta] = m_inputs_embedder->get_position_ids(inputs.get_shape()[1], 0);
+            return std::make_shared<SequenceGroup>(request_id,
+                                                   inputs,
+                                                   sampling_params_copy,
+                                                   type_ids,
+                                                   lm_extra_inputs,
+                                                   position_ids,
+                                                   rope_delta,
+                                                   ids_of_prompt);
+        }
+        return std::make_shared<SequenceGroup>(request_id, inputs, sampling_params_copy, type_ids);
+    };
+    std::shared_ptr<SequenceGroup> sequence_group = make_sequence_group(input_ids, token_type_ids, prompt_ids);
+    if (m_cache_store) {
+        // prefetch_cache keeps the prefix the store can serve and the one token computed after it
+        const size_t keep = m_cache_store->prompt_length_to_keep(sequence_group);
+        if (keep < prompt_len) {
+            const auto shorten = [keep](const std::optional<ov::Tensor>& tensor) -> std::optional<ov::Tensor> {
+                return tensor ? std::make_optional(first_tokens(*tensor, keep)) : std::nullopt;
+            };
+            sequence_group = make_sequence_group(first_tokens(input_ids, keep), shorten(token_type_ids), shorten(prompt_ids));
+        }
     }
 
     // Enable hidden state accumulation for speech output (Qwen3-Omni).
@@ -379,6 +409,60 @@ GenerationHandle ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request
     } else {
         OPENVINO_THROW("Unknown model input type.");
     }
+}
+
+std::pair<uint64_t, GenerationConfig> ContinuousBatchingPipeline::ContinuousBatchingImpl::cache_request(
+    const PromptCachePolicy& policy) {
+    OPENVINO_ASSERT(m_cache_store, "push_cache and prefetch_cache need an enabled SchedulerConfig::cache_store");
+    GenerationConfig config = m_generation_config;
+    // one prefill: the prompt is processed and a single token is sampled greedily
+    config.max_new_tokens = 1;
+    config.min_new_tokens = 0;
+    config.num_beams = 1;
+    config.num_return_sequences = 1;
+    config.do_sample = false;
+    config.prompt_cache = policy;
+    return {CACHE_REQUEST_ID_BASE + m_next_cache_request_id++, config};
+}
+
+std::future<PushCacheOutcome> ContinuousBatchingPipeline::ContinuousBatchingImpl::push_cache_async(
+    const ov::Tensor& input_ids,
+    const PromptCachePolicy& policy) {
+    OPENVINO_ASSERT(m_model_input_type == ModelInputType::TOKENS,
+                    "push_cache with token ids needs a model with token input; pass the prompt as text");
+    const auto [request_id, config] = cache_request(policy);
+    std::future<PushCacheOutcome> outcome = m_cache_store->expect_push(request_id);
+    add_cache_request(request_id, input_ids, config);
+    return outcome;
+}
+
+std::future<PushCacheOutcome> ContinuousBatchingPipeline::ContinuousBatchingImpl::push_cache_async(
+    const std::string& prompt,
+    const PromptCachePolicy& policy) {
+    const auto [request_id, config] = cache_request(policy);
+    std::future<PushCacheOutcome> outcome = m_cache_store->expect_push(request_id);
+    add_cache_request(request_id, prompt, config);
+    return outcome;
+}
+
+std::future<PrefetchCacheOutcome> ContinuousBatchingPipeline::ContinuousBatchingImpl::prefetch_cache_async(
+    const ov::Tensor& input_ids,
+    const PromptCachePolicy& policy) {
+    OPENVINO_ASSERT(m_model_input_type == ModelInputType::TOKENS,
+                    "prefetch_cache with token ids needs a model with token input; pass the prompt as text");
+    const auto [request_id, config] = cache_request(policy);
+    std::future<PrefetchCacheOutcome> outcome = m_cache_store->expect_prefetch(request_id);
+    add_cache_request(request_id, input_ids, config);
+    return outcome;
+}
+
+std::future<PrefetchCacheOutcome> ContinuousBatchingPipeline::ContinuousBatchingImpl::prefetch_cache_async(
+    const std::string& prompt,
+    const PromptCachePolicy& policy) {
+    const auto [request_id, config] = cache_request(policy);
+    std::future<PrefetchCacheOutcome> outcome = m_cache_store->expect_prefetch(request_id);
+    add_cache_request(request_id, prompt, config);
+    return outcome;
 }
 
 bool ContinuousBatchingPipeline::ContinuousBatchingImpl::has_non_finished_requests() {
@@ -920,8 +1004,14 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_free_non_running_reque
                     m_scheduler->free_sequence(sequence->get_id());
                 }
             }
-            m_sampler->clear_request_info(request->get_request_id());
+            const uint64_t request_id = request->get_request_id();
+            m_sampler->clear_request_info(request_id);
             requests_iterator = m_requests.erase(requests_iterator);
+            if (request_id >= CACHE_REQUEST_ID_BASE) {
+                // a push_cache / prefetch_cache request is done: its handle is not needed any more
+                std::lock_guard<std::mutex> lock(m_cache_request_handles_mutex);
+                m_cache_request_handles.erase(request_id);
+            }
         } else {
             requests_iterator++;
         }

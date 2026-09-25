@@ -213,4 +213,34 @@ struct CacheDiagnostics {
     }
 };
 
+/**
+ * @brief What `push_cache` published into the cache store.
+ *
+ * Counts blocks this push wrote; blocks the store already held are not written again (the first write of a block stays).
+ */
+struct PushCacheOutcome {
+    /** Channel groups that received blocks (e.g. "kv" and "linear_attention_state"). */
+    std::size_t groups = 0;
+    /** Blocks written, all groups. */
+    std::size_t blocks = 0;
+    /** Payload bytes written. */
+    std::uint64_t bytes = 0;
+    /** Order of this push among the pipeline's pushes, starting at 1. */
+    std::uint64_t epoch = 0;
+    /** Cache facts of the push's prefill (what the device and the store already supplied). */
+    CacheDiagnostics diagnostics;
+};
+
+/**
+ * @brief What `prefetch_cache` warmed: store blocks moved into the device prefix cache.
+ */
+struct PrefetchCacheOutcome {
+    /** Prompt tokens the store supplied into the device prefix cache. */
+    std::size_t tokens = 0;
+    /** Blocks read from the store. */
+    std::size_t blocks = 0;
+    /** Cache facts of the warm-up; `miss_reason` says why nothing was warmed. */
+    CacheDiagnostics diagnostics;
+};
+
 }  // namespace ov::genai

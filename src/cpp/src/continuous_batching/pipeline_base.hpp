@@ -155,6 +155,22 @@ public:
     virtual void step() = 0;
 
     /**
+     * Queues a push into the cache store (see ContinuousBatchingPipeline::push_cache_async). Pipelines without a cache
+     * store tier throw.
+     */
+    virtual std::future<PushCacheOutcome> push_cache_async(const ov::Tensor& input_ids, const PromptCachePolicy& policy);
+    virtual std::future<PushCacheOutcome> push_cache_async(const std::string& prompt, const PromptCachePolicy& policy);
+
+    /**
+     * Queues a cache store warm-up (see ContinuousBatchingPipeline::prefetch_cache_async). Pipelines without a cache
+     * store tier throw.
+     */
+    virtual std::future<PrefetchCacheOutcome> prefetch_cache_async(const ov::Tensor& input_ids,
+                                                                   const PromptCachePolicy& policy);
+    virtual std::future<PrefetchCacheOutcome> prefetch_cache_async(const std::string& prompt,
+                                                                   const PromptCachePolicy& policy);
+
+    /**
      * Performs monolitic generation based on encoded prompts
      */
     virtual std::vector<EncodedGenerationResult>

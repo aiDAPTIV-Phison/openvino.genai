@@ -44,6 +44,30 @@ Tokenizer ContinuousBatchingPipeline::IContinuousBatchingPipeline::get_tokenizer
     return m_tokenizer;
 }
 
+std::future<PushCacheOutcome> ContinuousBatchingPipeline::IContinuousBatchingPipeline::push_cache_async(
+    const ov::Tensor&,
+    const PromptCachePolicy&) {
+    OPENVINO_THROW("push_cache is not supported by this pipeline: it has no cache store tier");
+}
+
+std::future<PushCacheOutcome> ContinuousBatchingPipeline::IContinuousBatchingPipeline::push_cache_async(
+    const std::string&,
+    const PromptCachePolicy&) {
+    OPENVINO_THROW("push_cache is not supported by this pipeline: it has no cache store tier");
+}
+
+std::future<PrefetchCacheOutcome> ContinuousBatchingPipeline::IContinuousBatchingPipeline::prefetch_cache_async(
+    const ov::Tensor&,
+    const PromptCachePolicy&) {
+    OPENVINO_THROW("prefetch_cache is not supported by this pipeline: it has no cache store tier");
+}
+
+std::future<PrefetchCacheOutcome> ContinuousBatchingPipeline::IContinuousBatchingPipeline::prefetch_cache_async(
+    const std::string&,
+    const PromptCachePolicy&) {
+    OPENVINO_THROW("prefetch_cache is not supported by this pipeline: it has no cache store tier");
+}
+
 void ContinuousBatchingPipeline::IContinuousBatchingPipeline::start_chat(const std::string& system_message) {
     if (!system_message.empty()) {
         m_history.push_back({{"role", "system"}, {"content", system_message}});

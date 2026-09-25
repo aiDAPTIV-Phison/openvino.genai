@@ -15,7 +15,9 @@ using ov::genai::CacheTier;
 using ov::genai::CacheTtl;
 using ov::genai::ExplicitCache;
 using ov::genai::ImplicitCache;
+using ov::genai::PrefetchCacheOutcome;
 using ov::genai::PromptCachePolicy;
+using ov::genai::PushCacheOutcome;
 using ov::genai::SessionScope;
 using ov::genai::SharedScope;
 using ov::genai::WriteTrigger;
@@ -154,4 +156,20 @@ void init_cache_store(py::module_& m) {
         .def_readonly("served_by", &CacheDiagnostics::served_by)
         .def_readonly("miss_reason", &CacheDiagnostics::miss_reason)
         .def("interpretation", &CacheDiagnostics::interpretation);
+
+    py::class_<PushCacheOutcome>(m, "PushCacheOutcome", "What ContinuousBatchingPipeline.push_cache() published.")
+        .def(py::init<>())
+        .def_readonly("groups", &PushCacheOutcome::groups, "Channel groups that received blocks.")
+        .def_readonly("blocks", &PushCacheOutcome::blocks, "Blocks written; blocks the store held are not rewritten.")
+        .def_readonly("bytes", &PushCacheOutcome::bytes, "Payload bytes written.")
+        .def_readonly("epoch", &PushCacheOutcome::epoch, "Order of this push among the pipeline's pushes, from 1.")
+        .def_readonly("diagnostics", &PushCacheOutcome::diagnostics, "Cache facts of the push's prefill.");
+
+    py::class_<PrefetchCacheOutcome>(m,
+                                     "PrefetchCacheOutcome",
+                                     "What ContinuousBatchingPipeline.prefetch_cache() moved into the device cache.")
+        .def(py::init<>())
+        .def_readonly("tokens", &PrefetchCacheOutcome::tokens, "Prompt tokens the store supplied to the device cache.")
+        .def_readonly("blocks", &PrefetchCacheOutcome::blocks, "Blocks read from the store.")
+        .def_readonly("diagnostics", &PrefetchCacheOutcome::diagnostics, "Cache facts of the warm-up.");
 }

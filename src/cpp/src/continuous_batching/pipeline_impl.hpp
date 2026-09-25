@@ -118,6 +118,29 @@ protected:
 
     virtual void drop_requests();
 
+    /// @return A request id and the generation config of a push_cache / prefetch_cache request: one greedy token after
+    /// the prompt, under @p policy.
+    std::pair<uint64_t, GenerationConfig> cache_request(const PromptCachePolicy& policy);
+
+    /// Adds the request of an announced push or prefetch and keeps its handle until the request is freed (a request whose
+    /// handle is destroyed is stopped); forgets the announcement when the request cannot be added.
+    template <typename Input>
+    void add_cache_request(uint64_t request_id, const Input& input, const GenerationConfig& config) {
+        try {
+            GenerationHandle handle = add_request(request_id, input, config);
+            std::lock_guard<std::mutex> lock(m_cache_request_handles_mutex);
+            m_cache_request_handles[request_id] = std::move(handle);
+        } catch (...) {
+            m_cache_store->cancel_expected(request_id, std::current_exception());
+            throw;
+        }
+    }
+
+    std::atomic<uint64_t> m_next_cache_request_id{0};
+    // handles of the push_cache / prefetch_cache requests not freed yet, by request id
+    std::mutex m_cache_request_handles_mutex;
+    std::map<uint64_t, GenerationHandle> m_cache_request_handles;
+
 public:
     ContinuousBatchingImpl(const std::shared_ptr<ov::Model>& model,
                            const Tokenizer& tokenizer,
@@ -158,6 +181,13 @@ public:
     }
 
     void step() override;
+
+    std::future<PushCacheOutcome> push_cache_async(const ov::Tensor& input_ids, const PromptCachePolicy& policy) override;
+    std::future<PushCacheOutcome> push_cache_async(const std::string& prompt, const PromptCachePolicy& policy) override;
+    std::future<PrefetchCacheOutcome> prefetch_cache_async(const ov::Tensor& input_ids,
+                                                           const PromptCachePolicy& policy) override;
+    std::future<PrefetchCacheOutcome> prefetch_cache_async(const std::string& prompt,
+                                                           const PromptCachePolicy& policy) override;
 
     /**
      * input_ids is a batch of input ids for generation, which can be either raw prompts or already encoded token ids,

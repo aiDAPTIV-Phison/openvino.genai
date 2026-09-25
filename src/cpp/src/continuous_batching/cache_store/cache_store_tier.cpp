@@ -210,36 +210,32 @@ const CacheStoreTier::OpenNamespace* CacheStoreTier::session_namespace(const std
 void CacheStoreTier::on_add_request(const SequenceGroup::Ptr& group) {
     CacheDiagnostics& diagnostics = group->get_cache_diagnostics();
     const GenerationConfig& sampling_params = group->get_sampling_parameters();
+    ExpectedRequest expected = take_expected(group->get_request_id());
     if (group->num_total_seqs() != 1 || sampling_params.is_beam_search() || sampling_params.num_return_sequences != 1) {
         diagnostics.miss_reason = "unsupported request: the cache store serves single-sequence requests";
+        RequestState unsupported(group, m_kv_channel->block_size_tokens, m_witness_key);
+        unsupported.expected = std::move(expected);
+        finish_expected(unsupported);
         return;
     }
 
     const std::size_t block_size = m_kv_channel->block_size_tokens;
     auto state = std::make_unique<RequestState>(group, block_size, m_witness_key);
     const PromptCachePolicy& policy = sampling_params.prompt_cache;
-    state->read_namespaces = {&m_shared};
-    state->write_namespace = &m_shared;
-    if (policy.is_session_scoped()) {
-        std::string error;
-        const std::string scope = scope_key(policy.scope);
-        if (const OpenNamespace* session = session_namespace(scope, error)) {
-            state->read_namespaces.insert(state->read_namespaces.begin(), session);
-            state->write_namespace = session;
-        } else {
-            // a session's blocks never go to the shared namespace: the request only reads shared blocks
-            state->write_namespace = nullptr;
-            if (!m_reported_session_failure.exchange(true)) {
-                GENAI_WARN("Cache store: the namespace of '" + scope + "' cannot be opened (" + error +
-                           "); session requests read the shared namespace and write nothing. Further failures are not "
-                           "reported.");
-            }
-        }
+    select_namespaces(*state, policy);
+    state->expected = std::move(expected);
+    if (state->expected.push) {
+        // push_cache publishes the whole sequence, including what the device prefix cache supplied (IfAbsent)
+        state->write_mode = state->write_namespace ? WriteMode::Push : WriteMode::None;
+    } else if (state->expected.prefetch) {
+        state->write_mode = WriteMode::None;  // a warm-up creates nothing in the store
+    } else {
+        state->write_mode = state->write_namespace ? write_mode_of(policy) : WriteMode::None;
     }
-    state->write_mode = state->write_namespace ? write_mode_of(policy) : WriteMode::None;
     // A block the device cache supplied is never written again, even when its last token is recomputed: that rewrites
     // the block's quantization data, so its bytes would differ from the ones already stored under the same key
-    state->write_cursor = (group->get_num_processed_tokens() + block_size - 1) / block_size;
+    state->write_cursor =
+        state->write_mode == WriteMode::Push ? 0 : (group->get_num_processed_tokens() + block_size - 1) / block_size;
     // on_access_selective: the complete blocks the device cache supplied are the ones proven reused
     state->reused_blocks = group->get_num_processed_tokens() / block_size;
     plan_reload(*state);
@@ -247,6 +243,28 @@ void CacheStoreTier::on_add_request(const SequenceGroup::Ptr& group) {
     const std::uint64_t seq_id = (*group)[0]->get_id();
     std::lock_guard<std::mutex> lock(m_requests_mutex);
     m_requests[seq_id] = std::move(state);
+}
+
+void CacheStoreTier::select_namespaces(RequestState& state, const PromptCachePolicy& policy) {
+    state.read_namespaces = {&m_shared};
+    state.write_namespace = &m_shared;
+    if (!policy.is_session_scoped()) {
+        return;
+    }
+    std::string error;
+    const std::string scope = scope_key(policy.scope);
+    if (const OpenNamespace* session = session_namespace(scope, error)) {
+        state.read_namespaces.insert(state.read_namespaces.begin(), session);
+        state.write_namespace = session;
+        return;
+    }
+    // a session's blocks never go to the shared namespace: the request only reads shared blocks
+    state.write_namespace = nullptr;
+    if (!m_reported_session_failure.exchange(true)) {
+        GENAI_WARN("Cache store: the namespace of '" + scope + "' cannot be opened (" + error +
+                   "); session requests read the shared namespace and write nothing. Further failures are not "
+                   "reported.");
+    }
 }
 
 CacheStoreTier::WriteMode CacheStoreTier::write_mode_of(const PromptCachePolicy& policy) const {
@@ -264,6 +282,118 @@ CacheStoreTier::WriteMode CacheStoreTier::write_mode_of(const PromptCachePolicy&
         return WriteMode::None;
     }
     return WriteMode::None;
+}
+
+std::future<PushCacheOutcome> CacheStoreTier::expect_push(std::uint64_t request_id) {
+    auto push = std::make_shared<PushTracker>();
+    push->outcome.epoch = ++m_push_epoch;  // I12
+    std::future<PushCacheOutcome> outcome = push->promise.get_future();
+    std::lock_guard<std::mutex> lock(m_expected_mutex);
+    m_expected[request_id].push = std::move(push);
+    return outcome;
+}
+
+std::future<PrefetchCacheOutcome> CacheStoreTier::expect_prefetch(std::uint64_t request_id) {
+    auto prefetch = std::make_shared<std::promise<PrefetchCacheOutcome>>();
+    std::future<PrefetchCacheOutcome> outcome = prefetch->get_future();
+    std::lock_guard<std::mutex> lock(m_expected_mutex);
+    m_expected[request_id].prefetch = std::move(prefetch);
+    return outcome;
+}
+
+void CacheStoreTier::cancel_expected(std::uint64_t request_id, std::exception_ptr error) {
+    const ExpectedRequest expected = take_expected(request_id);
+    if (expected.push) {
+        expected.push->promise.set_exception(error);
+    }
+    if (expected.prefetch) {
+        expected.prefetch->set_exception(error);
+    }
+}
+
+CacheStoreTier::ExpectedRequest CacheStoreTier::take_expected(std::uint64_t request_id) {
+    std::lock_guard<std::mutex> lock(m_expected_mutex);
+    const auto it = m_expected.find(request_id);
+    if (it == m_expected.end()) {
+        return {};
+    }
+    ExpectedRequest expected = std::move(it->second);
+    m_expected.erase(it);
+    return expected;
+}
+
+void CacheStoreTier::settle_push(const std::shared_ptr<PushTracker>& push,
+                                 const std::string& group,
+                                 std::size_t blocks,
+                                 std::uint64_t bytes) {
+    if (!push) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(push->mutex);
+    push->outcome.blocks += blocks;
+    push->outcome.bytes += bytes;
+    if (blocks > 0) {
+        push->groups.insert(group);
+    }
+    push->pending_batches -= 1;
+    if (push->request_freed && push->pending_batches == 0) {
+        push->outcome.groups = push->groups.size();
+        push->promise.set_value(push->outcome);
+    }
+}
+
+void CacheStoreTier::finish_expected(RequestState& state) {
+    const CacheDiagnostics& diagnostics = state.group->get_cache_diagnostics();
+    if (state.expected.prefetch) {
+        PrefetchCacheOutcome outcome;
+        outcome.tokens = diagnostics.store_hit_tokens;
+        outcome.blocks = diagnostics.store_read_blocks;
+        outcome.diagnostics = diagnostics;
+        if (outcome.tokens == 0 && outcome.diagnostics.miss_reason.empty()) {
+            // the warm-up was cut to one token: the probes that sized it know why
+            outcome.diagnostics.miss_reason = state.expected.miss_reason;
+        }
+        state.expected.prefetch->set_value(outcome);
+        state.expected.prefetch.reset();
+    }
+    if (state.expected.push) {
+        const std::shared_ptr<PushTracker> push = std::move(state.expected.push);
+        std::lock_guard<std::mutex> lock(push->mutex);
+        push->outcome.diagnostics = diagnostics;
+        push->request_freed = true;
+        // the writes queued so far complete it, or nothing is left to wait for
+        if (push->pending_batches == 0) {
+            push->outcome.groups = push->groups.size();
+            push->promise.set_value(push->outcome);
+        }
+    }
+}
+
+std::size_t CacheStoreTier::prompt_length_to_keep(const SequenceGroup::Ptr& group) {
+    const std::size_t prompt_len = group->get_prompt_len();
+    {
+        std::lock_guard<std::mutex> lock(m_expected_mutex);
+        const auto it = m_expected.find(group->get_request_id());
+        if (it == m_expected.end() || !it->second.prefetch) {
+            return prompt_len;
+        }
+    }
+    // Probes only: the prefix the store can serve from the first token, then the one token that is always computed
+    RequestState probe_state(group, m_kv_channel->block_size_tokens, m_witness_key);
+    select_namespaces(probe_state, group->get_sampling_parameters().prompt_cache);
+    const std::optional<Discovery> found = discover(probe_state, 0);
+    const std::size_t servable = found ? found->position : 0;
+    if (servable == 0) {
+        std::string reason = !found ? "the prompt holds no complete block"
+                             : found->probe_failure.empty() ? "not in the store"
+                                                            : "the store is unavailable: " + found->probe_failure;
+        std::lock_guard<std::mutex> lock(m_expected_mutex);
+        const auto it = m_expected.find(group->get_request_id());
+        if (it != m_expected.end()) {
+            it->second.miss_reason = std::move(reason);
+        }
+    }
+    return std::min(prompt_len, servable + 1);
 }
 
 std::vector<bool> CacheStoreTier::probe(RequestState& state,
@@ -505,52 +635,49 @@ void CacheStoreTier::forget_stored_from(RequestState& state, std::size_t token_p
     }
 }
 
-void CacheStoreTier::plan_reload(RequestState& state) {
+std::optional<CacheStoreTier::Discovery> CacheStoreTier::discover(RequestState& state, std::size_t device_tokens) {
     SequenceGroup& group = *state.group;
     CacheDiagnostics& diagnostics = group.get_cache_diagnostics();
     const std::size_t block_size = m_kv_channel->block_size_tokens;
     const std::size_t prompt_len = group.get_prompt_len();
-    const std::size_t device_tokens = group.get_num_processed_tokens();
     // at least one prompt token is always computed
     if (device_tokens + 1 >= prompt_len) {
-        return;
+        return std::nullopt;
     }
     if (device_tokens % block_size != 0) {
         diagnostics.miss_reason = "the device prefix ends inside a block";
-        return;
+        return std::nullopt;
     }
     const std::size_t max_position = prompt_len - 1;
     const std::size_t first_block = device_tokens / block_size;
     const std::size_t num_complete = prompt_len / block_size;
     if (first_block >= num_complete) {
-        return;
+        return std::nullopt;
     }
     state.identity.extend(group, *group[0], num_complete);
 
     // Bounded fixpoint over the channels (guide section 14.4): a paged channel reaches the end of the run of present
     // blocks, a whole-state channel the largest present checkpoint; the common position is their minimum
-    std::vector<int> kv_present(num_complete, -1);
-    std::vector<const OpenNamespace*> kv_source(num_complete, nullptr);  // the namespace a present block is read from
-    std::map<std::size_t, bool> la_present;
-    std::map<std::size_t, const OpenNamespace*> la_source;
-    std::string probe_failure;
+    Discovery found;
+    found.kv_present.assign(num_complete, -1);
+    found.kv_source.assign(num_complete, nullptr);
     std::size_t position = max_position;
     for (std::size_t round = 1; round <= MAX_RECONCILE_ROUNDS; ++round) {
         diagnostics.store_probe_rounds = round;
         const std::size_t needed_blocks = std::min((position + block_size - 1) / block_size, num_complete);
         std::vector<std::size_t> unknown;
         for (std::size_t block = first_block; block < needed_blocks; ++block) {
-            if (kv_present[block] < 0) {
+            if (found.kv_present[block] < 0) {
                 unknown.push_back(block);
             }
         }
-        const std::vector<const OpenNamespace*> kv_found = locate(state, *m_kv_channel, unknown, probe_failure);
+        const std::vector<const OpenNamespace*> kv_found = locate(state, *m_kv_channel, unknown, found.probe_failure);
         for (std::size_t i = 0; i < unknown.size(); ++i) {
-            kv_present[unknown[i]] = kv_found[i] ? 1 : 0;
-            kv_source[unknown[i]] = kv_found[i];
+            found.kv_present[unknown[i]] = kv_found[i] ? 1 : 0;
+            found.kv_source[unknown[i]] = kv_found[i];
         }
         std::size_t reach = first_block;
-        while (reach < needed_blocks && kv_present[reach] == 1) {
+        while (reach < needed_blocks && found.kv_present[reach] == 1) {
             ++reach;
         }
         std::size_t candidate = std::min(position, reach * block_size);
@@ -559,7 +686,7 @@ void CacheStoreTier::plan_reload(RequestState& state) {
             const std::size_t interval = m_la_channel->block_size_tokens;
             std::vector<std::size_t> unknown_checkpoints;
             for (std::size_t checkpoint = candidate / interval * interval; checkpoint > device_tokens; checkpoint -= interval) {
-                if (!la_present.count(checkpoint)) {
+                if (!found.la_present.count(checkpoint)) {
                     unknown_checkpoints.push_back(checkpoint);
                 }
             }
@@ -573,14 +700,14 @@ void CacheStoreTier::plan_reload(RequestState& state) {
                 checkpoint_blocks.push_back(checkpoint / block_size - 1);
             }
             const std::vector<const OpenNamespace*> la_found =
-                locate(state, *m_la_channel, checkpoint_blocks, probe_failure);
+                locate(state, *m_la_channel, checkpoint_blocks, found.probe_failure);
             for (std::size_t i = 0; i < unknown_checkpoints.size(); ++i) {
-                la_present[unknown_checkpoints[i]] = la_found[i] != nullptr;
-                la_source[unknown_checkpoints[i]] = la_found[i];
+                found.la_present[unknown_checkpoints[i]] = la_found[i] != nullptr;
+                found.la_source[unknown_checkpoints[i]] = la_found[i];
             }
             std::size_t best = device_tokens;
             for (std::size_t checkpoint = candidate / interval * interval; checkpoint > device_tokens; checkpoint -= interval) {
-                if (la_present[checkpoint]) {
+                if (found.la_present[checkpoint]) {
                     best = checkpoint;
                     break;
                 }
@@ -594,17 +721,34 @@ void CacheStoreTier::plan_reload(RequestState& state) {
             break;
         }
     }
+    found.position = position;
+    return found;
+}
+
+void CacheStoreTier::plan_reload(RequestState& state) {
+    SequenceGroup& group = *state.group;
+    CacheDiagnostics& diagnostics = group.get_cache_diagnostics();
+    const std::size_t block_size = m_kv_channel->block_size_tokens;
+    const std::size_t device_tokens = group.get_num_processed_tokens();
+    const std::optional<Discovery> found = discover(state, device_tokens);
+    if (!found) {
+        return;
+    }
+    const std::size_t first_block = device_tokens / block_size;
+    const std::size_t num_complete = found->kv_present.size();
+    std::size_t position = found->position;
     state.kv_writes.assign(num_complete, StoreWrite::IfAbsent);
     for (std::size_t block = first_block; block < num_complete; ++block) {
-        if (kv_present[block] >= 0) {
-            state.kv_writes[block] = kv_present[block] == 1 ? StoreWrite::Never : StoreWrite::Always;
+        if (found->kv_present[block] >= 0) {
+            state.kv_writes[block] = found->kv_present[block] == 1 ? StoreWrite::Never : StoreWrite::Always;
         }
     }
-    for (const auto& [checkpoint, present] : la_present) {
+    for (const auto& [checkpoint, present] : found->la_present) {
         state.checkpoint_writes[checkpoint] = present ? StoreWrite::Never : StoreWrite::Always;
     }
     if (position <= device_tokens) {
-        diagnostics.miss_reason = probe_failure.empty() ? "not in the store" : "the store is unavailable: " + probe_failure;
+        diagnostics.miss_reason =
+            found->probe_failure.empty() ? "not in the store" : "the store is unavailable: " + found->probe_failure;
         return;
     }
 
@@ -615,7 +759,7 @@ void CacheStoreTier::plan_reload(RequestState& state) {
     for (std::size_t block = first_block; block < num_blocks; ++block) {
         BlockRead item;
         item.channel = m_kv_channel;
-        item.ns = kv_source[block];
+        item.ns = found->kv_source[block];
         item.block = block;
         item.payload = m_staging.try_acquire(m_kv_channel->block_bytes);
         if (!item.payload) {
@@ -627,7 +771,7 @@ void CacheStoreTier::plan_reload(RequestState& state) {
     if (m_la_channel) {
         BlockRead item;
         item.channel = m_la_channel;
-        item.ns = la_source.at(position);
+        item.ns = found->la_source.at(position);
         item.block = position / block_size - 1;
         item.payload = m_staging.try_acquire(m_la_channel->block_bytes);
         if (reads.size() < num_blocks - first_block || !item.payload) {
@@ -794,7 +938,7 @@ void CacheStoreTier::after_step(const std::vector<SequenceGroup::Ptr>& requests,
         if (!state) {
             continue;
         }
-        if (state->write_mode == WriteMode::Immediate) {
+        if (state->write_mode == WriteMode::Immediate || state->write_mode == WriteMode::Push) {
             write_complete_blocks(*state, true);
         } else if (state->write_mode == WriteMode::OnAccess) {
             write_reused_blocks(*state, true);
@@ -816,6 +960,7 @@ void CacheStoreTier::on_free_sequence(std::uint64_t seq_id) {
     // the blocks are still the sequence's, so what the step budget held back is written now
     switch (state->write_mode) {
     case WriteMode::Immediate:
+    case WriteMode::Push:
         write_complete_blocks(*state, false);
         break;
     case WriteMode::OnAccess:
@@ -827,6 +972,7 @@ void CacheStoreTier::on_free_sequence(std::uint64_t seq_id) {
     case WriteMode::None:
         break;
     }
+    finish_expected(*state);
 }
 
 void CacheStoreTier::on_overwrite(CacheType type, uint64_t hash, size_t block_index) {
@@ -918,6 +1064,7 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
         batch->channel = channel;
         batch->root = ns.root;
         batch->expires_at = expires_at;
+        batch->push = state.expected.push;
         return batch;
     };
     const std::shared_ptr<WriteBatch> kv_batch = make_batch(m_kv_channel);
@@ -987,6 +1134,10 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
         m_codec.download(*batch->channel, cache_tensors(*batch->channel), *transfers);
         diagnostics.pushed_blocks += transfers->size();
         diagnostics.pushed_bytes += transfers->size() * batch->channel->block_bytes;
+        if (batch->push) {
+            std::lock_guard<std::mutex> lock(batch->push->mutex);
+            batch->push->pending_batches += 1;
+        }
         m_io_pool.submit([this, batch] {
             run_write_batch(batch);
         });
@@ -1185,6 +1336,7 @@ void CacheStoreTier::run_write_batch(const std::shared_ptr<WriteBatch>& batch) {
     }
     const std::size_t count = write->requests.size();
     if (count == 0) {
+        settle_push(batch->push, channel.group, 0, 0);
         return;
     }
     write->results.resize(count);
@@ -1241,6 +1393,15 @@ void CacheStoreTier::finish_write(const WriteBatch& batch,
     if (m_config.durability == CacheStoreConfig::Durability::Strict) {
         batch.store->flush();
     }
+    std::size_t written = 0;
+    std::uint64_t written_bytes = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (results[i].status == OV_KVCACHE_OK) {
+            written += 1;
+            written_bytes += requests[i].bytes;
+        }
+    }
+    settle_push(batch.push, batch.channel->group, written, written_bytes);
 }
 
 void CacheStoreTier::complete_writes() {

@@ -7,9 +7,13 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -85,6 +89,22 @@ public:
     /// Inside `schedule()`, before any device write of the step: copies the evicted blocks out and queues their writes.
     void before_block_writes() override;
 
+    /// push_cache: the request added next with @p request_id publishes every complete block, whatever the trigger.
+    /// @return Its outcome, ready once the request is freed and its writes are terminal.
+    std::future<PushCacheOutcome> expect_push(std::uint64_t request_id);
+
+    /// prefetch_cache: the request added next with @p request_id only brings stored blocks into the device cache.
+    /// @return Its outcome, ready once the request is freed.
+    std::future<PrefetchCacheOutcome> expect_prefetch(std::uint64_t request_id);
+
+    /// Forgets an expected push or prefetch whose request could not be added; its future gets @p error.
+    void cancel_expected(std::uint64_t request_id, std::exception_ptr error);
+
+    /// `add_request`, before the device prefix restore: for a prefetch request, the number of prompt tokens to keep, i.e.
+    /// the prefix the store can serve plus the one token that is always computed (probes only); for any other request,
+    /// its whole prompt.
+    std::size_t prompt_length_to_keep(const SequenceGroup::Ptr& group);
+
 private:
     /// A namespace opened in the provider: its bytes, its store instance and the root of its key chains.
     struct OpenNamespace {
@@ -118,6 +138,24 @@ private:
         Immediate,  // every block as soon as it is complete
         OnAccess,   // the blocks the request reused from the device prefix cache (`on_access_selective`)
         OnEvict,    // when the device cache evicts the blocks, or when the pipeline is destroyed
+        Push,       // push_cache: every complete block, including the ones the device prefix cache supplied
+    };
+
+    /// The outcome of one push_cache, completed by whichever thread accounts its last write.
+    struct PushTracker {
+        std::mutex mutex;
+        std::promise<PushCacheOutcome> promise;
+        PushCacheOutcome outcome;
+        std::set<std::string> groups;
+        std::size_t pending_batches = 0;  // queued write batches not accounted yet
+        bool request_freed = false;
+    };
+
+    /// A push or prefetch announced before its request is added.
+    struct ExpectedRequest {
+        std::shared_ptr<PushTracker> push;                                // set for a push
+        std::shared_ptr<std::promise<PrefetchCacheOutcome>> prefetch;     // set for a prefetch
+        std::string miss_reason;  // a prefetch the store could not serve: why
     };
 
     /// What the tier keeps per request (one sequence).
@@ -141,6 +179,18 @@ private:
         // what the reload's probes found in the store; a block or checkpoint missing here was not probed (IfAbsent)
         std::vector<StoreWrite> kv_writes;                    // by KV block index
         std::map<std::size_t, StoreWrite> checkpoint_writes;  // by end position
+        // push_cache or prefetch_cache that added the request
+        ExpectedRequest expected;
+    };
+
+    /// What the probes found beyond the device prefix: the bounded fixpoint of guide section 14.4 without any read.
+    struct Discovery {
+        std::size_t position = 0;  // common token position every channel can serve (not above the device prefix: miss)
+        std::vector<int> kv_present;                        // by block: -1 not probed, 0 absent, 1 present
+        std::vector<const OpenNamespace*> kv_source;        // by block: where a present block is read from
+        std::map<std::size_t, bool> la_present;             // by checkpoint end position
+        std::map<std::size_t, const OpenNamespace*> la_source;
+        std::string probe_failure;
     };
 
     /// One block to read and where it goes.
@@ -171,6 +221,7 @@ private:
         Digest128 root{0, 0};
         std::uint64_t expires_at = 0;
         std::vector<BlockWrite> blocks;
+        std::shared_ptr<PushTracker> push;  // the push_cache the batch belongs to, if any
     };
 
     /// A block a finished `on_evict` request left in the device prefix cache: what its write needs once it is evicted.
@@ -207,8 +258,23 @@ private:
     /// when the provider cannot open it (@p error says why).
     const OpenNamespace* session_namespace(const std::string& scope, std::string& error);
 
+    /// Sets the request's read and write namespaces from its policy's scope (I6); opens a session namespace on first use.
+    void select_namespaces(RequestState& state, const PromptCachePolicy& policy);
+
     /// @return How the request's blocks are written, from the engine trigger and the request's policy.
     WriteMode write_mode_of(const PromptCachePolicy& policy) const;
+
+    /// Takes the push or prefetch announced for a request id, if any.
+    ExpectedRequest take_expected(std::uint64_t request_id);
+
+    /// Accounts @p blocks written (@p bytes) of a push's batch; completes the push when it was the last thing pending.
+    static void settle_push(const std::shared_ptr<PushTracker>& push,
+                            const std::string& group,
+                            std::size_t blocks,
+                            std::uint64_t bytes);
+
+    /// The request of a push or prefetch is freed: completes the prefetch, or the push once its writes are accounted.
+    static void finish_expected(RequestState& state);
 
     /// Immediate: writes the request's complete blocks from the write cursor on.
     void write_complete_blocks(RequestState& state, bool within_budget);
@@ -238,6 +304,10 @@ private:
     /// Discover and verify (guide section 11): probes the store beyond the device prefix, converges on the prefix every
     /// channel can serve, reads it into staging and verifies it.
     void plan_reload(RequestState& state);
+
+    /// Discover only: the bounded fixpoint over the channels from @p device_tokens on, probing the request's read
+    /// namespaces. @return Nothing when the request cannot use the store (see plan_reload's guards).
+    std::optional<Discovery> discover(RequestState& state, std::size_t device_tokens);
 
     /// Probes the keys of @p blocks of a channel (each KV block index the item ends with) in one namespace.
     /// @return true = present. A failed probe counts as absent and sets @p failure.
@@ -311,6 +381,11 @@ private:
 
     std::atomic<std::size_t> m_failed_writes{0};
     std::atomic<bool> m_reported_write_failure{false};
+
+    // push_cache / prefetch_cache announced before their requests are added, by request id
+    std::mutex m_expected_mutex;
+    std::map<std::uint64_t, ExpectedRequest> m_expected;
+    std::atomic<std::uint64_t> m_push_epoch{0};
 
     // OnEvict: blocks of finished requests still in the device cache, by cache type and prefix hash, and the ones
     // evicted in the current step with their physical block index. Never held while calling the orchestrator.

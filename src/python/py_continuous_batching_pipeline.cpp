@@ -36,8 +36,55 @@ using ov::genai::KVCrushConfig;
 using ov::genai::ChatHistory;
 using ov::genai::AdaptiveRKVConfig;
 using ov::genai::VideoMetadata;
+using ov::genai::PrefetchCacheOutcome;
+using ov::genai::PromptCachePolicy;
+using ov::genai::PushCacheOutcome;
 
 namespace {
+
+/// Result of push_cache_async() / prefetch_cache_async(): done() polls, get() waits without holding the GIL.
+template <typename Outcome>
+struct CacheOperationFuture {
+    std::shared_future<Outcome> future;
+
+    bool done() const {
+        return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    }
+
+    Outcome get() const {
+        py::gil_scoped_release release;
+        return future.get();
+    }
+};
+
+using PushCacheFuture = CacheOperationFuture<PushCacheOutcome>;
+using PrefetchCacheFuture = CacheOperationFuture<PrefetchCacheOutcome>;
+
+auto push_cache_docstring = R"(
+    Publishes a token sequence into the cache store: prefills it (reusing what the device prefix cache and the store
+    already hold) and writes every complete block, whatever the write trigger. Runs pipeline steps until the push and its
+    writes are done. Needs SchedulerConfig.cache_store enabled.
+
+    :param input_ids or prompt: token ids (models with token input), or a prompt the pipeline encodes like add_request().
+    :param policy: PromptCachePolicy: scope and time-to-live of what is written.
+    :return: PushCacheOutcome.
+)";
+
+auto prefetch_cache_docstring = R"(
+    Advisory warm-up: brings the prefix of a token sequence that the cache store holds into the device prefix cache, so a
+    later request with that prefix starts from the device. Only stored blocks are moved (one token is computed to admit
+    them); nothing is written. Best effort: a later request may still miss, for example after eviction.
+
+    :param input_ids or prompt: token ids (models with token input), or a prompt the pipeline encodes like add_request().
+    :param policy: PromptCachePolicy: scope of the namespaces to read.
+    :return: PrefetchCacheOutcome.
+)";
+
+auto cache_async_docstring = R"(
+    Asynchronous form: queues the operation like add_request() and returns a future at once. It runs while the pipeline
+    runs steps (step(), or a synchronous push_cache() / prefetch_cache()), next to other added requests; like any pending
+    request, it keeps generate() from starting. future.get() waits for the outcome.
+)";
 
 auto cache_eviction_config_docstring = R"(
     Configuration struct for the cache eviction algorithm.
@@ -468,6 +515,18 @@ void init_continuous_batching_pipeline(py::module_& m) {
             .def_readonly("max_cache_usage", &PipelineMetrics::max_cache_usage)
             .def_readonly("la_peak_pool_blocks", &PipelineMetrics::la_peak_pool_blocks);
 
+    py::class_<PushCacheFuture>(m,
+                                "PushCacheFuture",
+                                "Result of push_cache_async(): done() polls, get() waits for the PushCacheOutcome.")
+        .def("done", &PushCacheFuture::done)
+        .def("get", &PushCacheFuture::get);
+
+    py::class_<PrefetchCacheFuture>(m,
+                                    "PrefetchCacheFuture",
+                                    "Result of prefetch_cache_async(): done() polls, get() waits for the PrefetchCacheOutcome.")
+        .def("done", &PrefetchCacheFuture::done)
+        .def("get", &PrefetchCacheFuture::get);
+
     py::class_<ContinuousBatchingPipeline>(m, "ContinuousBatchingPipeline", "This class is used for generation with LLMs with continuous batchig")
         .def(py::init([](const std::filesystem::path& models_path, const SchedulerConfig& scheduler_config, const std::string& device, const std::map<std::string, py::object>& llm_plugin_config,
                          const std::map<std::string, py::object>& tokenizer_plugin_config, const std::map<std::string, py::object>& inputs_embedder_plugin_config) {
@@ -571,6 +630,79 @@ void init_continuous_batching_pipeline(py::module_& m) {
         
         .def("step", &ContinuousBatchingPipeline::step)
         .def("has_non_finished_requests", &ContinuousBatchingPipeline::has_non_finished_requests)
+
+        .def(
+            "push_cache",
+            [](ContinuousBatchingPipeline& pipe, const ov::Tensor& input_ids, const PromptCachePolicy& policy) {
+                py::gil_scoped_release release;
+                return pipe.push_cache(input_ids, policy);
+            },
+            py::arg("input_ids"),
+            py::arg("policy") = PromptCachePolicy{},
+            push_cache_docstring)
+        .def(
+            "push_cache",
+            [](ContinuousBatchingPipeline& pipe, const std::string& prompt, const PromptCachePolicy& policy) {
+                py::gil_scoped_release release;
+                return pipe.push_cache(prompt, policy);
+            },
+            py::arg("prompt"),
+            py::arg("policy") = PromptCachePolicy{},
+            push_cache_docstring)
+        .def(
+            "push_cache_async",
+            [](ContinuousBatchingPipeline& pipe, const ov::Tensor& input_ids, const PromptCachePolicy& policy) {
+                py::gil_scoped_release release;
+                return PushCacheFuture{pipe.push_cache_async(input_ids, policy).share()};
+            },
+            py::arg("input_ids"),
+            py::arg("policy") = PromptCachePolicy{},
+            cache_async_docstring)
+        .def(
+            "push_cache_async",
+            [](ContinuousBatchingPipeline& pipe, const std::string& prompt, const PromptCachePolicy& policy) {
+                py::gil_scoped_release release;
+                return PushCacheFuture{pipe.push_cache_async(prompt, policy).share()};
+            },
+            py::arg("prompt"),
+            py::arg("policy") = PromptCachePolicy{},
+            cache_async_docstring)
+        .def(
+            "prefetch_cache",
+            [](ContinuousBatchingPipeline& pipe, const ov::Tensor& input_ids, const PromptCachePolicy& policy) {
+                py::gil_scoped_release release;
+                return pipe.prefetch_cache(input_ids, policy);
+            },
+            py::arg("input_ids"),
+            py::arg("policy") = PromptCachePolicy{},
+            prefetch_cache_docstring)
+        .def(
+            "prefetch_cache",
+            [](ContinuousBatchingPipeline& pipe, const std::string& prompt, const PromptCachePolicy& policy) {
+                py::gil_scoped_release release;
+                return pipe.prefetch_cache(prompt, policy);
+            },
+            py::arg("prompt"),
+            py::arg("policy") = PromptCachePolicy{},
+            prefetch_cache_docstring)
+        .def(
+            "prefetch_cache_async",
+            [](ContinuousBatchingPipeline& pipe, const ov::Tensor& input_ids, const PromptCachePolicy& policy) {
+                py::gil_scoped_release release;
+                return PrefetchCacheFuture{pipe.prefetch_cache_async(input_ids, policy).share()};
+            },
+            py::arg("input_ids"),
+            py::arg("policy") = PromptCachePolicy{},
+            cache_async_docstring)
+        .def(
+            "prefetch_cache_async",
+            [](ContinuousBatchingPipeline& pipe, const std::string& prompt, const PromptCachePolicy& policy) {
+                py::gil_scoped_release release;
+                return PrefetchCacheFuture{pipe.prefetch_cache_async(prompt, policy).share()};
+            },
+            py::arg("prompt"),
+            py::arg("policy") = PromptCachePolicy{},
+            cache_async_docstring)
 
         .def("start_chat", [](ContinuousBatchingPipeline& pipe, const std::string& system_message) {
             PyErr_WarnEx(PyExc_DeprecationWarning,

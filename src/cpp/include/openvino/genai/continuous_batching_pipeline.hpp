@@ -4,6 +4,7 @@
 #pragma once
 
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <string>
 #include <optional>
@@ -299,6 +300,41 @@ public:
     void step();
 
     bool has_non_finished_requests();
+
+    /**
+     * @brief Publishes a token sequence into the cache store: prefills it (reusing what the device prefix cache and the
+     * store already hold) and writes every complete block, whatever the write trigger. Runs pipeline steps until the push
+     * and its writes are done. Requires an enabled `SchedulerConfig::cache_store`.
+     * @param policy Scope and time-to-live of what is written.
+     */
+    PushCacheOutcome push_cache(const ov::Tensor& input_ids, const PromptCachePolicy& policy = {});
+    /// @brief Same, for a prompt the pipeline tokenizes (or embeds, for a vision-language model) like add_request().
+    PushCacheOutcome push_cache(const std::string& prompt, const PromptCachePolicy& policy = {});
+
+    /**
+     * @brief Asynchronous push_cache(): queues the push like add_request() and returns at once. The push runs while the
+     * pipeline runs steps (step(), or a synchronous push_cache() / prefetch_cache()), next to other added requests; like
+     * any pending request, it keeps generate() from starting. The future is ready when its writes are done.
+     */
+    std::future<PushCacheOutcome> push_cache_async(const ov::Tensor& input_ids, const PromptCachePolicy& policy = {});
+    std::future<PushCacheOutcome> push_cache_async(const std::string& prompt, const PromptCachePolicy& policy = {});
+
+    /**
+     * @brief Advisory reload warm-up: brings the prefix of a token sequence that the cache store holds into the device
+     * prefix cache, so a later request with that prefix starts from the device. Only stored blocks are moved (one token
+     * is computed to admit them); nothing is written. Best effort: it reserves nothing, and a later request may still miss
+     * the device cache, for example after eviction. Runs pipeline steps until the warm-up is done.
+     * @param policy Scope of the namespaces to read.
+     */
+    PrefetchCacheOutcome prefetch_cache(const ov::Tensor& input_ids, const PromptCachePolicy& policy = {});
+    /// @brief Same, for a prompt the pipeline tokenizes (or embeds, for a vision-language model) like add_request().
+    PrefetchCacheOutcome prefetch_cache(const std::string& prompt, const PromptCachePolicy& policy = {});
+
+    /// @brief Asynchronous prefetch_cache(), completed while the pipeline runs steps (see push_cache_async()).
+    std::future<PrefetchCacheOutcome> prefetch_cache_async(const ov::Tensor& input_ids,
+                                                           const PromptCachePolicy& policy = {});
+    std::future<PrefetchCacheOutcome> prefetch_cache_async(const std::string& prompt,
+                                                           const PromptCachePolicy& policy = {});
 
     /// Higher level interface, which can process multiple prompts in continuous batching manner
     std::vector<EncodedGenerationResult> generate(const std::vector<ov::Tensor>& input_ids, const std::vector<ov::genai::GenerationConfig>& sampling_params, const ov::genai::StreamerVariant& streamer=std::monostate{});
