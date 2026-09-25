@@ -104,8 +104,12 @@ struct CacheStoreConfig {
     Durability durability = Durability::Relaxed;
     /** Verify every block read back against the tokens its key was derived from. Must stay true. */
     bool verify_key_tokens = true;
-    /** Also store a checksum of every block's bytes and verify it on read (more expensive). */
-    bool verify_payload_crc = false;
+    /**
+     * Also store a checksum (CRC32C) of every block's bytes and verify it on read. On by default: the witness proves
+     * which content a block belongs to, not that its bytes are intact, so without the checksum a store that returns
+     * damaged bytes under an intact witness is served as a hit. Detects accidental damage, not a deliberate forgery.
+     */
+    bool verify_payload_crc = true;
     /** Bytes copied between the device cache and staging for store writes in one pipeline step. */
     std::size_t step_transfer_budget_bytes = 16 * 1024 * 1024;
     WritePolicy write;

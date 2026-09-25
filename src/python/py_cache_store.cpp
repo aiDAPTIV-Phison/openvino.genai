@@ -38,7 +38,8 @@ auto cache_store_config_docstring = R"(
     :param io_threads: number of host I/O threads calling the provider.
     :param durability: CacheStoreConfig.Durability.Relaxed or Strict.
     :param verify_key_tokens: verify blocks read back against their tokens; must stay True.
-    :param verify_payload_crc: also store and verify a checksum of every block.
+    :param verify_payload_crc: also store and verify a checksum of every block (default True: the witness proves the
+                               block's identity, not the integrity of its bytes).
     :param step_transfer_budget_bytes: bytes copied between device cache and staging for store writes per step.
     :param write: engine-level write policy, write.device_to_store.trigger and write.host_to_store.trigger.
     :param properties: provider settings as a dict of strings; assign a whole dict, items of the returned copy cannot
