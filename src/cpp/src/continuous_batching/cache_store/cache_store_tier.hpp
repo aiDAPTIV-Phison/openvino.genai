@@ -166,8 +166,7 @@ private:
 
         SequenceGroup::Ptr group;
         SequenceIdentity identity;
-        // I6: a session request is served from its session namespace or the shared one, whichever reaches further, and
-        // writes to its session namespace
+        // I6: a session request reads its session namespace, then the shared one, and writes to its session namespace
         std::vector<const OpenNamespace*> read_namespaces;
         const OpenNamespace* write_namespace = nullptr;
         WriteMode write_mode = WriteMode::None;
@@ -177,8 +176,8 @@ private:
         std::size_t reused_blocks = 0;
         std::size_t access_cursor = 0;
         std::unique_ptr<ReloadPlan> reload;
-        // What the reload's probe found in the write namespace, by KV block index; a block missing here was not probed
-        // (IfAbsent). A linear attention state is written with the KV block it ends in, so it has no entry of its own.
+        // What the reload's probe found in the request's namespaces, by KV block index; a block missing here was not
+        // probed (IfAbsent). A linear attention state is written with the KV block it ends in, so it has no entry of its own.
         std::vector<StoreWrite> kv_writes;
         // push_cache or prefetch_cache that added the request
         ExpectedRequest expected;
@@ -196,16 +195,15 @@ private:
     /// What the probes found: the prefix every channel can serve (guide section 14.4), without any read.
     struct Discovery {
         std::size_t position = 0;  // common token position every channel can serve (not above the device prefix: miss)
-        const OpenNamespace* source = nullptr;  // the namespace that serves it; a prompt is read from one namespace
-        bool write_namespace_probed = false;
-        std::vector<bool> kv_stored;  // by KV block: what the write namespace holds
+        std::vector<const OpenNamespace*> kv_source;  // by KV block: the namespace it is read from, nullptr = absent
+        const OpenNamespace* la_source = nullptr;     // where the state at `position` is read from
         std::string probe_failure;
     };
 
     /// One block to read and where it goes.
     struct BlockRead {
         const StoreChannel* channel = nullptr;
-        const OpenNamespace* ns = nullptr;  // the namespace that serves the reload
+        const OpenNamespace* ns = nullptr;  // where the probe found it
         std::size_t block = 0;  // KV block index the item ends with
         StagingLease payload;
         std::array<std::uint8_t, 2 * WitnessRecord::SIZE> witness{};
@@ -321,8 +319,8 @@ private:
     /// can serve beyond the device prefix, reads it into staging and verifies it.
     void plan_reload(RequestState& state);
 
-    /// Discover only: probes each of the request's read namespaces with the prompt's key chain and takes the namespace
-    /// that serves the longest prefix beyond @p device_tokens. @return Nothing when the request cannot use the store
+    /// Discover only: probes each of the request's read namespaces with the prompt's key chain and takes each block
+    /// from the first namespace that holds it. @return Nothing when the request cannot use the store
     /// (see plan_reload's guards).
     std::optional<Discovery> discover(RequestState& state, std::size_t device_tokens);
 

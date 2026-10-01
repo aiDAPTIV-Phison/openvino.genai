@@ -446,13 +446,14 @@ std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& r
         item.request.target.bytes = item.channel->block_bytes;
         item.request.witness_out = {item.witness.data(), item.witness.size()};
     }
-    // Batches of consecutive items, one per I/O thread; each is an in-order run of the sequence, and a state stays in
-    // the call of the KV block it ends in
+    // Batches of consecutive items of one namespace, one per I/O thread; each is an in-order run of the sequence, and
+    // a state stays in the call of the KV block it ends in
     const std::size_t batch_size = std::max<std::size_t>(1, (reads.size() + m_config.io_threads - 1) / m_config.io_threads);
     std::vector<std::pair<std::size_t, std::size_t>> batches;
     for (std::size_t start = 0; start < reads.size();) {
-        std::size_t end = std::min(reads.size(), start + batch_size);
-        while (end < reads.size() && reads[end].channel != m_kv_channel) {
+        std::size_t end = start + 1;
+        while (end < reads.size() && reads[end].ns == reads[start].ns &&
+               (end - start < batch_size || reads[end].channel != m_kv_channel)) {
             ++end;
         }
         batches.emplace_back(start, end);
@@ -639,39 +640,44 @@ std::optional<CacheStoreTier::Discovery> CacheStoreTier::discover(RequestState& 
     // channel the largest present checkpoint below it (guide section 14.4); one probe answers both.
     Discovery found;
     diagnostics.store_probe_rounds = 1;
+    found.kv_source.assign(num_complete, nullptr);
+    std::shared_ptr<const KeyChain> layout;  // where each key sits in a chain; the same in every namespace
+    std::vector<std::pair<const OpenNamespace*, std::vector<bool>>> probes;
     for (const OpenNamespace* ns : state.read_namespaces) {
-        const std::shared_ptr<const KeyChain> chain = key_chain(state, *ns, num_complete);
+        layout = key_chain(state, *ns, num_complete);
         bool probed = false;
-        const std::vector<bool> present = probe(state, *ns, chain->keys, probed, found.probe_failure);
-        std::size_t reach = first_block;
-        while (reach < num_complete && present[chain->kv_index[reach]]) {
-            ++reach;
-        }
-        std::size_t position = std::min(max_position, reach * block_size);
-        if (m_la_channel) {
-            const std::size_t interval = m_la_channel->block_size_tokens;
-            std::size_t best = device_tokens;
-            for (std::size_t checkpoint = position / interval * interval; checkpoint > device_tokens; checkpoint -= interval) {
-                if (present[chain->la_index.at(checkpoint / block_size - 1)]) {
-                    best = checkpoint;
-                    break;
-                }
-            }
-            position = best;
-        }
-        // A prompt is served from one namespace: a store sees one sequence per call. The first namespace wins a tie.
-        if (!found.source || position > found.position) {
-            found.source = ns;
-            found.position = position;
-        }
-        if (ns == state.write_namespace && probed) {
-            found.write_namespace_probed = true;
-            found.kv_stored.resize(num_complete);
-            for (std::size_t block = 0; block < num_complete; ++block) {
-                found.kv_stored[block] = present[chain->kv_index[block]];
+        probes.emplace_back(ns, probe(state, *ns, layout->keys, probed, found.probe_failure));
+        // each block from the first namespace that holds it, in the request's order of preference (I6)
+        for (std::size_t block = 0; block < num_complete; ++block) {
+            if (!found.kv_source[block] && probes.back().second[layout->kv_index[block]]) {
+                found.kv_source[block] = ns;
             }
         }
     }
+    std::size_t reach = first_block;
+    while (reach < num_complete && found.kv_source[reach]) {
+        ++reach;
+    }
+    std::size_t position = std::min(max_position, reach * block_size);
+    if (m_la_channel) {
+        const std::size_t interval = m_la_channel->block_size_tokens;
+        std::size_t best = device_tokens;
+        for (std::size_t checkpoint = position / interval * interval; checkpoint > device_tokens && best == device_tokens;
+             checkpoint -= interval) {
+            // A state and the KV block it ends in are read from the same namespace, in one call
+            const std::size_t block = checkpoint / block_size - 1;
+            for (const auto& [ns, present] : probes) {
+                if (present[layout->la_index.at(block)] && present[layout->kv_index[block]]) {
+                    best = checkpoint;
+                    found.la_source = ns;
+                    found.kv_source[block] = ns;
+                    break;
+                }
+            }
+        }
+        position = best;
+    }
+    found.position = position;
     return found;
 }
 
@@ -687,16 +693,12 @@ void CacheStoreTier::plan_reload(RequestState& state) {
     const std::size_t first_block = device_tokens / block_size;
     const std::size_t num_complete = group.get_prompt_len() / block_size;
     std::size_t position = found->position;
-    state.kv_writes.assign(num_complete, StoreWrite::IfAbsent);
-    if (found->write_namespace_probed) {
-        for (std::size_t block = 0; block < num_complete; ++block) {
-            state.kv_writes[block] = found->kv_stored[block] ? StoreWrite::Never : StoreWrite::Always;
-        }
-        // What the write namespace lacks is written even when the device cache or another namespace supplies it, so
-        // the namespace holds the sequence from its first block
-        const auto absent = std::find(found->kv_stored.begin(), found->kv_stored.end(), false);
-        if (absent != found->kv_stored.end()) {
-            state.write_cursor = std::min(state.write_cursor, static_cast<std::size_t>(absent - found->kv_stored.begin()));
+    // A block one of the request's namespaces holds is not written again: a session that extends a shared prefix
+    // stores only its own part
+    state.kv_writes.assign(num_complete, StoreWrite::Always);
+    for (std::size_t block = 0; block < num_complete; ++block) {
+        if (found->kv_source[block]) {
+            state.kv_writes[block] = StoreWrite::Never;
         }
     }
     if (position <= device_tokens) {
@@ -704,35 +706,34 @@ void CacheStoreTier::plan_reload(RequestState& state) {
             found->probe_failure.empty() ? "not in the store" : "the store is unavailable: " + found->probe_failure;
         return;
     }
-    const OpenNamespace* source = found->source;
-
-    // Fetch into staging: the KV blocks in order, then the state at the end, right after the KV block it ends in
+    // Fetch into staging, each block from the namespace its probe found it in: the KV blocks in order, then the state
+    // at the end, right after the KV block it ends in
     const std::size_t num_blocks = (position + block_size - 1) / block_size;
     std::vector<BlockRead> reads;
     reads.reserve(num_blocks - first_block + 1);
     for (std::size_t block = first_block; block < num_blocks; ++block) {
         BlockRead item;
         item.channel = m_kv_channel;
-        item.ns = source;
+        item.ns = found->kv_source[block];
         item.block = block;
         item.payload = m_staging.try_acquire(m_kv_channel->block_bytes);
         if (!item.payload) {
             break;
         }
-        item.request.key.hash = state.identity.key(source->root, block, m_kv_channel->group);
+        item.request.key.hash = state.identity.key(item.ns->root, block, m_kv_channel->group);
         reads.push_back(std::move(item));
     }
     if (m_la_channel) {
         BlockRead item;
         item.channel = m_la_channel;
-        item.ns = source;
+        item.ns = found->la_source;
         item.block = position / block_size - 1;
         item.payload = m_staging.try_acquire(m_la_channel->block_bytes);
         if (reads.size() < num_blocks - first_block || !item.payload) {
             diagnostics.miss_reason = "the staging pool cannot hold the reload";
             return;
         }
-        item.request.key.hash = state.identity.key(source->root, item.block, m_la_channel->group);
+        item.request.key.hash = state.identity.key(item.ns->root, item.block, m_la_channel->group);
         reads.push_back(std::move(item));
     } else if (reads.empty()) {
         diagnostics.miss_reason = "the staging pool cannot hold the reload";
@@ -741,7 +742,6 @@ void CacheStoreTier::plan_reload(RequestState& state) {
     diagnostics.degraded_chunks += fetch(state, reads);
 
     // A block that fails verification is a miss for itself and everything after it
-    const bool repairable = source == state.write_namespace;
     std::size_t verified_blocks = first_block;
     std::string failure;
     for (const BlockRead& item : reads) {
@@ -757,9 +757,7 @@ void CacheStoreTier::plan_reload(RequestState& state) {
         if (!item.failure.empty()) {
             // nothing from here on is trusted: it is written again once recomputed, which repairs the store in one pass
             failure = item.failure;
-            if (repairable) {
-                forget_stored_from(state, item.block * block_size);
-            }
+            forget_stored_from(state, item.block * block_size);
             break;
         }
         ++verified_blocks;
@@ -768,9 +766,7 @@ void CacheStoreTier::plan_reload(RequestState& state) {
         const std::string& la_failure = reads.back().failure;
         if (!la_failure.empty()) {
             // A state is stored with the KV block it ends in, so the pair is written again from that block on
-            if (repairable) {
-                forget_stored_from(state, position - block_size);
-            }
+            forget_stored_from(state, position - block_size);
             failure = failure.empty() ? la_failure : failure;
         }
         if (!failure.empty() || verified_blocks < num_blocks) {
@@ -831,6 +827,8 @@ void CacheStoreTier::allocate_reloads(const std::vector<SequenceGroup::Ptr>& req
         group->update_processed_tokens_num(plan.target_tokens);
         diagnostics.store_hit_tokens = additional_tokens;
         diagnostics.served_by = CacheTier::Store;
+        const std::size_t block_size = m_kv_channel->block_size_tokens;
+        state->write_cursor = std::max(state->write_cursor, (plan.target_tokens + block_size - 1) / block_size);
         plan.allocated = true;
         m_pending_uploads.push_back(seq_id);
     }
