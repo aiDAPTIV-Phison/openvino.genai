@@ -363,6 +363,7 @@ private:
     const StoreChannel* m_la_channel = nullptr;
     StoreFingerprints m_fingerprints;
     std::shared_ptr<StoreProvider> m_provider;
+    StoreProvider::BlockLayout m_block_layout;  // what every store is told at open
     OpenNamespace m_shared;
     // session scopes (I6), by scope key; entries are never removed, so their addresses stay valid
     std::mutex m_sessions_mutex;

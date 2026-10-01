@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "openvino/genai/cache_store/provider_abi.hpp"
@@ -112,6 +113,14 @@ public:
         return m_capabilities;
     }
 
+    /** @brief What the host tells a store at `open` about the blocks it will pass (store ABI 1.1). */
+    struct BlockLayout {
+        /** Name and block size in bytes of every channel group. */
+        std::vector<std::pair<std::string, std::uint64_t>> groups;
+        /** Largest witness of a write. */
+        std::uint64_t witness_bytes_max = 0;
+    };
+
     struct OpenedStore {
         std::shared_ptr<StoreInstance> store;
         bool has_semantics_fingerprint = false;
@@ -123,7 +132,10 @@ public:
      * already has open in the same directory returns the same instance.
      * @param error Receives the reason when the result holds no store.
      */
-    OpenedStore open(const std::vector<std::uint8_t>& ns, const CacheStoreConfig& config, std::string& error) const;
+    OpenedStore open(const std::vector<std::uint8_t>& ns,
+                     const CacheStoreConfig& config,
+                     const BlockLayout& layout,
+                     std::string& error) const;
 
     /** @return Result of the provider's `purge` for a namespace. */
     OvKVCacheStatus purge(const std::vector<std::uint8_t>& ns) const;

@@ -110,7 +110,9 @@ CacheStoreTier::CacheStoreTier(const CacheStoreConfig& config,
       m_witness_key(load_witness_key()),
       m_staging(config.staging_bytes),
       m_io_pool(config.io_threads) {
+    m_block_layout.witness_bytes_max = WitnessRecord::SIZE;
     for (const StoreChannel& channel : m_channels) {
+        m_block_layout.groups.emplace_back(channel.group, channel.block_bytes);
         if (channel.cache_type == CacheType::KV_CACHE) {
             m_kv_channel = &channel;
         } else if (channel.cache_type == CacheType::LINEAR_ATTENTION_CACHE) {
@@ -163,13 +165,13 @@ bool CacheStoreTier::open_namespace(const std::string& scope, OpenNamespace& ope
     opened.scope = scope;
     opened.bytes = make_namespace(scope, m_fingerprints);
     std::string error;
-    StoreProvider::OpenedStore store = m_provider->open(opened.bytes, m_config, error);
+    StoreProvider::OpenedStore store = m_provider->open(opened.bytes, m_config, m_block_layout, error);
     if (!store.store && !m_provider->is_builtin()) {
         GENAI_WARN("Cache store provider '" + m_provider->name() + "' from " + m_provider->origin() +
                    " failed to open namespace '" + scope + "': " + error +
                    ". Falling back to the built-in \"file\" provider.");
         m_provider = StoreProvider::create_builtin();
-        store = m_provider->open(opened.bytes, m_config, error);
+        store = m_provider->open(opened.bytes, m_config, m_block_layout, error);
     }
     if (!store.store) {
         GENAI_WARN("The cache store is disabled: the built-in \"file\" provider failed to open namespace '" + scope +
@@ -193,7 +195,7 @@ const CacheStoreTier::OpenNamespace* CacheStoreTier::session_namespace(const std
     auto opened = std::make_unique<OpenNamespace>();
     opened->scope = scope;
     opened->bytes = make_namespace(scope, m_fingerprints);
-    const StoreProvider::OpenedStore store = m_provider->open(opened->bytes, m_config, error);
+    const StoreProvider::OpenedStore store = m_provider->open(opened->bytes, m_config, m_block_layout, error);
     if (!store.store) {
         return nullptr;
     }

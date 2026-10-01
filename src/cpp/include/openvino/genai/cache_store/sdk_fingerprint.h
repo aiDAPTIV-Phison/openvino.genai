@@ -11,4 +11,4 @@
  * The fingerprint names the GenAI release and the store ABI version; it changes with every GenAI release.
  * Pure C, so plugins written in C can include it.
  */
-#define OV_KVCACHE_STORE_SDK_BUILD_FINGERPRINT "openvino.genai 2026.4.0.0; kvcache store abi 1.0"
+#define OV_KVCACHE_STORE_SDK_BUILD_FINGERPRINT "openvino.genai 2026.4.0.0; kvcache store abi 1.1"

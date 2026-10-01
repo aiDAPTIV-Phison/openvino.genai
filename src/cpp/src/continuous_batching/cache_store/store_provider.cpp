@@ -302,8 +302,33 @@ std::shared_ptr<StoreProvider> StoreProvider::create(const CacheStoreConfig& con
     return create_builtin();
 }
 
+namespace {
+
+/// The log callback of the store ABI: plugin messages go to the GenAI logger. `log_ctx` is the provider's name.
+void log_from_store(void* log_ctx, OvKVCacheLogLevel level, const char* message) {
+    const std::string text = "Cache store provider '" + std::string(static_cast<const char*>(log_ctx)) +
+                             "': " + (message ? message : "");
+    switch (level) {
+    case OV_KVCACHE_LOG_ERROR:
+        GENAI_ERR(text);
+        break;
+    case OV_KVCACHE_LOG_WARNING:
+        GENAI_WARN(text);
+        break;
+    case OV_KVCACHE_LOG_INFO:
+        GENAI_INFO(text);
+        break;
+    default:
+        GENAI_DEBUG(text);
+        break;
+    }
+}
+
+}  // namespace
+
 StoreProvider::OpenedStore StoreProvider::open(const std::vector<std::uint8_t>& ns,
                                                const CacheStoreConfig& config,
+                                               const BlockLayout& layout,
                                                std::string& error) const {
     error.clear();
     const OpenStoreKey key{m_descriptor, config.directory, ns};
@@ -330,6 +355,17 @@ StoreProvider::OpenedStore StoreProvider::open(const std::vector<std::uint8_t>& 
     options.capacity_bytes = config.capacity_bytes;
     options.properties = properties.empty() ? nullptr : properties.data();
     options.property_count = properties.size();
+    std::vector<OvKVCacheGroupInfo> groups;
+    groups.reserve(layout.groups.size());
+    for (const auto& [group, block_bytes] : layout.groups) {
+        groups.push_back({group.data(), static_cast<std::uint32_t>(group.size()), 0, block_bytes});
+    }
+    options.groups = groups.empty() ? nullptr : groups.data();
+    options.group_count = groups.size();
+    options.witness_bytes_max = layout.witness_bytes_max;
+    options.log = log_from_store;
+    // The provider's name lives as long as its module, which is never unloaded
+    options.log_ctx = const_cast<char*>(m_descriptor->name ? m_descriptor->name : "");
     OvKVCacheStoreOpenResult result;
     std::memset(&result, 0, sizeof(result));
 

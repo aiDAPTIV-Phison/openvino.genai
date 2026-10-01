@@ -19,7 +19,9 @@
 // -----------------------------------------------------------------------------
 // WHAT IS *NOT* IN THIS ABI (deliberately, for stability):
 //   * tier / host / write-policy / residency / eviction policy
-//   * block / chunk / layer / tensor layout, bytes_per_block, sub-byte packing
+//   * block / chunk / layer / tensor layout, sub-byte packing (since 1.1 the
+//     byte size of a group's blocks is given at `open`, as an opaque number;
+//     the layout inside a block stays hidden)
 //   * the content-hash algorithm and the plugin's internal index structure
 //   * token ids, prompt text, or any reversible content ("preimage")
 //   * IPrefixIndex / IHostCache / IStagingBuffer / PlacementCopies
@@ -51,7 +53,9 @@
 //     a provider documents otherwise at open time; implementations must be
 //     either internally synchronized or explicitly single-threaded and
 //     serialized by the host.
-//   * The plugin MUST NOT call back into the host from any entry point.
+//   * The plugin MUST NOT call back into the host from any entry point. The
+//     only exception (since 1.1) is the log callback given at `open`, see
+//     `OvKVCacheLogFn`.
 //   * No C++ exception may cross this boundary. All failures are returned as
 //     `OvKVCacheStatus`; unknown/negative statuses are treated as failure.
 //   * Synchronous I/O is mandatory. Asynchronous I/O is an OPTIONAL capability
@@ -92,6 +96,11 @@
 //     enough to hold the entries it gates, and the host checks `struct_bytes`
 //     before using them.
 //   * The plugin library is never dlclose'd by the host.
+//   * 1.1 appends `groups`, `group_count`, `witness_bytes_max`, `log` and
+//     `log_ctx` to `OvKVCacheStoreOpenOptions`. A plugin built against 1.0
+//     reads only the fields it knows. A plugin that reports minor >= 1 may read
+//     the appended fields without a size check, because a host older than the
+//     plugin has already rejected it.
 // =============================================================================
 
 #include <stddef.h>
@@ -105,7 +114,7 @@
 /// a renamed entry symbol); the host rejects a major mismatch loudly instead of
 /// loading a stale plugin and failing later on symbol lookup.
 #define OV_KVCACHE_STORE_ABI_MAJOR 1
-#define OV_KVCACHE_STORE_ABI_MINOR 0
+#define OV_KVCACHE_STORE_ABI_MINOR 1
 
 /// The plugin module's single C discovery entry symbol.
 #define OV_KVCACHE_STORE_ENTRY_SYMBOL "ov_pipeline_query_kvcache_store_providers"
@@ -304,12 +313,52 @@ typedef struct OvKVCacheProperty {
     const char* value;
 } OvKVCacheProperty;
 
+/// Since 1.1. Byte size of the blocks of one cache group in the namespace being
+/// opened. The host lists every group it will use on the store instance, one
+/// entry per group, so a future cache kind is one more entry. The sizes are
+/// fixed for the namespace. A plugin may reject a key of an unlisted group, or
+/// a write whose `bytes` differs from `block_bytes`, with
+/// `OV_KVCACHE_ERR_INVALID_ARG`.
+typedef struct OvKVCacheGroupInfo {
+    const char* group;     ///< same bytes as `OvKVCacheBlockKey::group`; borrowed for the call
+    uint32_t group_len;
+    uint32_t reserved0;
+    uint64_t block_bytes;  ///< exact `bytes` of every read and write of this group
+} OvKVCacheGroupInfo;
+
+/// Since 1.1. Severity of a message passed to the host logger.
+typedef uint32_t OvKVCacheLogLevel;
+
+enum {
+    OV_KVCACHE_LOG_ERROR = 1,
+    OV_KVCACHE_LOG_WARNING = 2,
+    OV_KVCACHE_LOG_INFO = 3,
+    OV_KVCACHE_LOG_DEBUG = 4,
+};
+
+/// Since 1.1. Host logger handed to the plugin at `open`, so plugin messages
+/// (errors, metrics, debugging) appear in the host's own log. `message` is
+/// UTF-8, NUL-terminated and borrowed for the call. It prints only: nothing
+/// returns to the host.
+///   * Valid from the `open` call until `destroy` of the opened store returns;
+///     when `open` fails, only during the `open` call.
+///   * Callable from any plugin thread, concurrently.
+///   * The host filters by level, never throws from it and never calls the
+///     plugin from inside it.
+typedef void (*OvKVCacheLogFn)(void* log_ctx, OvKVCacheLogLevel level, const char* message);
+
 typedef struct OvKVCacheStoreOpenOptions {
     const char* directory;
-    uint64_t capacity_bytes;
+    uint64_t capacity_bytes;  ///< one budget for all groups of the namespace together
     const OvKVCacheProperty* properties;
     uint64_t property_count;
     uint32_t reserved0;
+    // ---- appended in 1.1 -------------------------------------------------------
+    const OvKVCacheGroupInfo* groups;  ///< every group the host will use on this instance; borrowed for the call
+    uint64_t group_count;
+    uint64_t witness_bytes_max;        ///< largest `witness.len` the host will pass to a write
+    OvKVCacheLogFn log;                ///< host logger; may be NULL
+    void* log_ctx;                     ///< passed back as the first argument of `log`
 } OvKVCacheStoreOpenOptions;
 
 // Forward declaration: the store instance vtable is produced by `open` and is
@@ -517,6 +566,7 @@ static_assert(std::is_standard_layout<OvKVCacheStoreWriteRequest>::value, "ABI s
 static_assert(std::is_standard_layout<OvKVCacheStoreWriteResult>::value, "ABI struct must be standard layout");
 static_assert(std::is_standard_layout<OvKVCacheStoreStats>::value, "ABI struct must be standard layout");
 static_assert(std::is_standard_layout<OvKVCacheProperty>::value, "ABI struct must be standard layout");
+static_assert(std::is_standard_layout<OvKVCacheGroupInfo>::value, "ABI struct must be standard layout");
 static_assert(std::is_standard_layout<OvKVCacheStoreOpenOptions>::value, "ABI struct must be standard layout");
 static_assert(std::is_standard_layout<OvKVCacheStoreOpenResult>::value, "ABI struct must be standard layout");
 static_assert(std::is_standard_layout<OvKVCacheStoredNamespaceInfo>::value, "ABI struct must be standard layout");
@@ -526,4 +576,9 @@ static_assert(std::is_standard_layout<OvKVCacheStoreModuleInfo>::value, "ABI str
 // `struct_bytes` must lead every vtable: the host uses it to bound tail reads.
 static_assert(offsetof(OvKVCacheStoreVTable, struct_bytes) == 0, "vtable must start with struct_bytes");
 static_assert(offsetof(OvKVCacheStoreProviderVTable, struct_bytes) == 0, "vtable must start with struct_bytes");
+
+// The 1.1 fields follow the 1.0 layout of the open options unchanged.
+static_assert(offsetof(OvKVCacheStoreOpenOptions, groups) ==
+                  offsetof(OvKVCacheStoreOpenOptions, reserved0) + 2 * sizeof(uint32_t),
+              "1.1 open options must start after the 1.0 fields and their padding");
 #endif
