@@ -39,6 +39,15 @@
 //     opaque payload. Keys are content-addressed, so a plugin can build its own
 //     internal index, deduplicate and shard using only the key.
 //   * The plugin owns storage identity: how keys map to its own files/objects.
+//   * Key order (rule of this phase; a later phase may relax it): every
+//     `has_blocks` call lists the keys of ONE sequence in one namespace, from
+//     its first block and in order; the key of a block of a later group (e.g.
+//     a linear attention state) directly follows the key of the first-group
+//     block it ends in. `read_blocks` / `write_blocks` calls are in-order runs
+//     of such a chain (they may start after the first block), a later-group
+//     block is written in the same call as the first-group block it ends in,
+//     and a write is preceded by a probe of its chain. A plugin may rely on
+//     this to keep sequences; one that ignores it sees independent keys.
 //   * A plugin hit is a *discovery*, not the truth. The host re-derives keys and
 //     verifies the returned `witness` before admitting anything; the plugin is
 //     never part of the host's correctness TCB.
