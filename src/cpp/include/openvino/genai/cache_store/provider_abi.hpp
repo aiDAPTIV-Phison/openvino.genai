@@ -105,8 +105,8 @@
 //     enough to hold the entries it gates, and the host checks `struct_bytes`
 //     before using them.
 //   * The plugin library is never dlclose'd by the host.
-//   * 1.1 appends `groups`, `group_count`, `witness_bytes_max`, `log` and
-//     `log_ctx` to `OvKVCacheStoreOpenOptions`. A plugin built against 1.0
+//   * 1.1 appends `groups`, `group_count`, `witness_bytes_max` and `log` to
+//     `OvKVCacheStoreOpenOptions`. A plugin built against 1.0
 //     reads only the fields it knows. A plugin that reports minor >= 1 may read
 //     the appended fields without a size check, because a host older than the
 //     plugin has already rejected it.
@@ -347,14 +347,14 @@ enum {
 
 /// Since 1.1. Host logger handed to the plugin at `open`, so plugin messages
 /// (errors, metrics, debugging) appear in the host's own log. `message` is
-/// UTF-8, NUL-terminated and borrowed for the call. It prints only: nothing
-/// returns to the host.
+/// UTF-8, NUL-terminated and borrowed for the call; the plugin names itself in
+/// it. It prints only: nothing returns to the host.
 ///   * Valid from the `open` call until `destroy` of the opened store returns;
 ///     when `open` fails, only during the `open` call.
 ///   * Callable from any plugin thread, concurrently.
 ///   * The host filters by level, never throws from it and never calls the
 ///     plugin from inside it.
-typedef void (*OvKVCacheLogFn)(void* log_ctx, OvKVCacheLogLevel level, const char* message);
+typedef void (*OvKVCacheLogFn)(OvKVCacheLogLevel level, const char* message);
 
 typedef struct OvKVCacheStoreOpenOptions {
     const char* directory;
@@ -367,7 +367,6 @@ typedef struct OvKVCacheStoreOpenOptions {
     uint64_t group_count;
     uint64_t witness_bytes_max;        ///< largest `witness.len` the host will pass to a write
     OvKVCacheLogFn log;                ///< host logger; may be NULL
-    void* log_ctx;                     ///< passed back as the first argument of `log`
 } OvKVCacheStoreOpenOptions;
 
 // Forward declaration: the store instance vtable is produced by `open` and is

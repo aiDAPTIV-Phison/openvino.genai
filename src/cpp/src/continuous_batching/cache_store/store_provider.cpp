@@ -304,10 +304,9 @@ std::shared_ptr<StoreProvider> StoreProvider::create(const CacheStoreConfig& con
 
 namespace {
 
-/// The log callback of the store ABI: plugin messages go to the GenAI logger. `log_ctx` is the provider's name.
-void log_from_store(void* log_ctx, OvKVCacheLogLevel level, const char* message) {
-    const std::string text = "Cache store provider '" + std::string(static_cast<const char*>(log_ctx)) +
-                             "': " + (message ? message : "");
+/// The log callback of the store ABI: plugin messages go to the GenAI logger.
+void log_from_store(OvKVCacheLogLevel level, const char* message) {
+    const std::string text = message ? message : "";
     switch (level) {
     case OV_KVCACHE_LOG_ERROR:
         GENAI_ERR(text);
@@ -364,8 +363,6 @@ StoreProvider::OpenedStore StoreProvider::open(const std::vector<std::uint8_t>& 
     options.group_count = groups.size();
     options.witness_bytes_max = layout.witness_bytes_max;
     options.log = log_from_store;
-    // The provider's name lives as long as its module, which is never unloaded
-    options.log_ctx = const_cast<char*>(m_descriptor->name ? m_descriptor->name : "");
     OvKVCacheStoreOpenResult result;
     std::memset(&result, 0, sizeof(result));
 
