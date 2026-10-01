@@ -166,7 +166,8 @@ private:
 
         SequenceGroup::Ptr group;
         SequenceIdentity identity;
-        // I6: a session request reads its session namespace, then the shared one, and writes to its session namespace
+        // I6: a session request is served from its session namespace or the shared one, whichever reaches further, and
+        // writes to its session namespace
         std::vector<const OpenNamespace*> read_namespaces;
         const OpenNamespace* write_namespace = nullptr;
         WriteMode write_mode = WriteMode::None;
@@ -176,27 +177,35 @@ private:
         std::size_t reused_blocks = 0;
         std::size_t access_cursor = 0;
         std::unique_ptr<ReloadPlan> reload;
-        // what the reload's probes found in the store; a block or checkpoint missing here was not probed (IfAbsent)
-        std::vector<StoreWrite> kv_writes;                    // by KV block index
-        std::map<std::size_t, StoreWrite> checkpoint_writes;  // by end position
+        // What the reload's probe found in the write namespace, by KV block index; a block missing here was not probed
+        // (IfAbsent). A linear attention state is written with the KV block it ends in, so it has no entry of its own.
+        std::vector<StoreWrite> kv_writes;
         // push_cache or prefetch_cache that added the request
         ExpectedRequest expected;
     };
 
-    /// What the probes found beyond the device prefix: the bounded fixpoint of guide section 14.4 without any read.
+    /// The keys of a sequence's first KV blocks in one namespace, from its first block and in order; the key of a
+    /// linear attention state follows the key of the KV block it ends in. Every provider call lists a sequence's keys
+    /// in this order (FINDINGS 7.4).
+    struct KeyChain {
+        std::vector<OvKVCacheBlockKey> keys;
+        std::vector<std::size_t> kv_index;             // by KV block: where its key is in `keys`
+        std::map<std::size_t, std::size_t> la_index;  // by KV block a checkpoint ends in: where the state's key is
+    };
+
+    /// What the probes found: the prefix every channel can serve (guide section 14.4), without any read.
     struct Discovery {
         std::size_t position = 0;  // common token position every channel can serve (not above the device prefix: miss)
-        std::vector<int> kv_present;                        // by block: -1 not probed, 0 absent, 1 present
-        std::vector<const OpenNamespace*> kv_source;        // by block: where a present block is read from
-        std::map<std::size_t, bool> la_present;             // by checkpoint end position
-        std::map<std::size_t, const OpenNamespace*> la_source;
+        const OpenNamespace* source = nullptr;  // the namespace that serves it; a prompt is read from one namespace
+        bool write_namespace_probed = false;
+        std::vector<bool> kv_stored;  // by KV block: what the write namespace holds
         std::string probe_failure;
     };
 
     /// One block to read and where it goes.
     struct BlockRead {
         const StoreChannel* channel = nullptr;
-        const OpenNamespace* ns = nullptr;  // where the probe found it
+        const OpenNamespace* ns = nullptr;  // the namespace that serves the reload
         std::size_t block = 0;  // KV block index the item ends with
         StagingLease payload;
         std::array<std::uint8_t, 2 * WitnessRecord::SIZE> witness{};
@@ -208,16 +217,18 @@ private:
     /// One block to write: where its payload is and what identifies it.
     struct BlockWrite {
         StagingLease payload;
+        const StoreChannel* channel = nullptr;
         OvKVCacheBlockKey key{};
+        std::size_t chain_index = 0;  // of the key in the batch's key chain
         std::size_t end_position = 0;
         Digest128 witness_chain{0, 0};
         bool if_absent = false;  // probed on the I/O pool first, and skipped when the store holds the key
     };
 
-    /// A batch of blocks of one channel, written by one provider call on the I/O pool.
+    /// Blocks of one sequence, in its order, written by one provider call on the I/O pool.
     struct WriteBatch {
         std::shared_ptr<StoreInstance> store;
-        const StoreChannel* channel = nullptr;
+        std::shared_ptr<const KeyChain> chain;  // the sequence's keys up to the batch's last block
         Digest128 root{0, 0};
         std::uint64_t expires_at = 0;
         std::vector<BlockWrite> blocks;
@@ -225,14 +236,19 @@ private:
     };
 
     /// A block a finished `on_evict` request left in the device prefix cache: what its write needs once it is evicted.
+    using WriteBackId = std::pair<CacheType, std::uint64_t>;  // cache type and prefix hash of a cached block
     struct WriteBack {
         const StoreChannel* channel = nullptr;
         const OpenNamespace* ns = nullptr;  // where the block is written
-        OvKVCacheContentHash key{0, 0};
+        std::shared_ptr<const KeyChain> chain;  // the keys of its sequence
+        std::size_t chain_index = 0;
+        std::size_t block = 0;  // KV block index the item ends with
         std::size_t end_position = 0;
         Digest128 witness_chain{0, 0};
         std::uint64_t ttl_seconds = 0;  // 0 = unlimited
         bool if_absent = true;
+        // the KV block's state, or the state's KV block: the two are written back together
+        std::optional<WriteBackId> partner;
     };
 
     /// A write batch submitted to an asynchronous store: everything the plugin may touch stays here, unmodified, until
@@ -241,6 +257,7 @@ private:
         std::shared_ptr<WriteBatch> batch;  // holds the payload leases
         std::vector<std::array<std::uint8_t, WitnessRecord::SIZE>> witnesses;
         std::vector<OvKVCacheStoreWriteRequest> requests;
+        std::vector<const StoreChannel*> channels;  // of each request
         std::vector<OvKVCacheStoreWriteResult> results;
         OvKVCacheAsyncToken token = 0;
     };
@@ -267,11 +284,10 @@ private:
     /// Takes the push or prefetch announced for a request id, if any.
     ExpectedRequest take_expected(std::uint64_t request_id);
 
-    /// Accounts @p blocks written (@p bytes) of a push's batch; completes the push when it was the last thing pending.
+    /// Accounts what a push's batch wrote (blocks and bytes by group); completes the push when it was the last thing
+    /// pending.
     static void settle_push(const std::shared_ptr<PushTracker>& push,
-                            const std::string& group,
-                            std::size_t blocks,
-                            std::uint64_t bytes);
+                            const std::map<std::string, std::pair<std::size_t, std::uint64_t>>& written);
 
     /// The request of a push or prefetch is freed: completes the prefetch, or the push once its writes are accounted.
     static void finish_expected(RequestState& state);
@@ -301,29 +317,28 @@ private:
     /// Waits until every queued write is terminal and its staging is free again.
     void wait_for_writes();
 
-    /// Discover and verify (guide section 11): probes the store beyond the device prefix, converges on the prefix every
-    /// channel can serve, reads it into staging and verifies it.
+    /// Discover and verify (guide section 11): probes the store with the prompt's keys, finds the prefix every channel
+    /// can serve beyond the device prefix, reads it into staging and verifies it.
     void plan_reload(RequestState& state);
 
-    /// Discover only: the bounded fixpoint over the channels from @p device_tokens on, probing the request's read
-    /// namespaces. @return Nothing when the request cannot use the store (see plan_reload's guards).
+    /// Discover only: probes each of the request's read namespaces with the prompt's key chain and takes the namespace
+    /// that serves the longest prefix beyond @p device_tokens. @return Nothing when the request cannot use the store
+    /// (see plan_reload's guards).
     std::optional<Discovery> discover(RequestState& state, std::size_t device_tokens);
 
-    /// Probes the keys of @p blocks of a channel (each KV block index the item ends with) in one namespace.
-    /// @return true = present. A failed probe counts as absent and sets @p failure.
+    /// @return The key chain of the sequence's first @p num_blocks KV blocks in a namespace; the request's identity
+    /// must cover them.
+    std::shared_ptr<const KeyChain> key_chain(RequestState& state, const OpenNamespace& ns, std::size_t num_blocks) const;
+
+    /// Probes keys in one namespace. @return true = present. A failed probe counts as absent, sets @p failure and
+    /// leaves @p probed false; so does a store without a probe, for which every key counts as present.
     std::vector<bool> probe(RequestState& state,
                             const OpenNamespace& ns,
-                            const StoreChannel& channel,
-                            const std::vector<std::size_t>& blocks,
+                            const std::vector<OvKVCacheBlockKey>& keys,
+                            bool& probed,
                             std::string& failure);
 
-    /// @return For each of @p blocks, the first of the request's read namespaces that holds it, or nullptr.
-    std::vector<const OpenNamespace*> locate(RequestState& state,
-                                             const StoreChannel& channel,
-                                             const std::vector<std::size_t>& blocks,
-                                             std::string& failure);
-
-    /// Fetches the items in batches of consecutive blocks of one channel and verifies each (sets `failure`). A
+    /// Fetches the items in batches of consecutive blocks and verifies each (sets `failure`). A
     /// synchronous store reads the batches in parallel on the I/O pool. An asynchronous store gets every batch submitted
     /// at once from this thread; they are waited for in order, and the first KV block that fails verification cancels
     /// the batches after it, which can no longer be used. @return The number of batches that degraded to per-block
@@ -337,19 +352,17 @@ private:
     /// @return Why a block read back cannot be used, or an empty string when it is verified.
     std::string verify(RequestState& state, const BlockRead& read) const;
 
-    /// Stops trusting what the probes found after @p token_position: blocks and checkpoints there are written again
-    /// once the request recomputes them.
+    /// Stops trusting what the probe found from @p token_position on: blocks there are written again once the request
+    /// recomputes them.
     void forget_stored_from(RequestState& state, std::size_t token_position) const;
 
-    /// Runs on the I/O pool: drops the IfAbsent blocks the store already holds, completes the witnesses and calls the
-    /// provider. An asynchronous store gets the batch submitted and handed to the completion thread.
+    /// Runs on the I/O pool: probes the store with the sequence's keys, drops the IfAbsent blocks it already holds,
+    /// completes the witnesses and calls the provider. An asynchronous store gets the batch submitted and handed to
+    /// the completion thread.
     void run_write_batch(const std::shared_ptr<WriteBatch>& batch);
 
-    /// Accounts a write batch whose status is terminal; a batch that failed as a whole is retried per block.
-    void finish_write(const WriteBatch& batch,
-                      const std::vector<OvKVCacheStoreWriteRequest>& requests,
-                      std::vector<OvKVCacheStoreWriteResult>& results,
-                      OvKVCacheStatus status);
+    /// Accounts a write batch whose status is terminal; a batch that failed as a whole is retried per KV block.
+    void finish_write(InflightWrite& write, OvKVCacheStatus status);
 
     /// Completion thread: waits for the submitted write batches in order, the only waiter of their tokens.
     void complete_writes();
@@ -391,7 +404,7 @@ private:
     // OnEvict: blocks of finished requests still in the device cache, by cache type and prefix hash, and the ones
     // evicted in the current step with their physical block index. Never held while calling the orchestrator.
     std::mutex m_write_back_mutex;
-    std::map<std::pair<CacheType, std::uint64_t>, WriteBack> m_write_back;
+    std::map<WriteBackId, WriteBack> m_write_back;
     std::vector<std::pair<WriteBack, std::size_t>> m_evicted;
     std::atomic<bool> m_reported_write_back_loss{false};
 
