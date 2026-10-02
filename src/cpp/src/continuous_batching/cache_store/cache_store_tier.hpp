@@ -124,7 +124,7 @@ private:
     };
 
     /// How a block is written, from what the reload's probes found in the store. Stored bytes depend on the history of
-    /// the computation (FINDINGS F8), so the first write of a key stays and a present key is never written again.
+    /// the computation, so the first write of a key stays and a present key is never written again.
     enum class StoreWrite : std::uint8_t {
         IfAbsent,  // never probed: written only when the store does not hold the key
         Always,    // absent, or present but failed verification: written, over any old one
@@ -132,7 +132,7 @@ private:
     };
 
     /// When a request's blocks are written: the engine trigger (guide section 14.1) adjusted by the request's policy
-    /// (section 14.2; interpretations I7-I10).
+    /// (section 14.2).
     enum class WriteMode : std::uint8_t {
         None,       // `explicit_only`, or an explicit-only request: only push_cache writes
         Immediate,  // every block as soon as it is complete
@@ -166,7 +166,7 @@ private:
 
         SequenceGroup::Ptr group;
         SequenceIdentity identity;
-        // I6: a session request reads its session namespace, then the shared one, and writes to its session namespace
+        // A session request reads its session namespace, then the shared one, and writes to its session namespace
         std::vector<const OpenNamespace*> read_namespaces;
         const OpenNamespace* write_namespace = nullptr;
         WriteMode write_mode = WriteMode::None;
@@ -185,7 +185,7 @@ private:
 
     /// The keys of a sequence's first KV blocks in one namespace, from its first block and in order; the key of a
     /// linear attention state follows the key of the KV block it ends in. Every provider call lists a sequence's keys
-    /// in this order (FINDINGS 7.4).
+    /// in this order.
     struct KeyChain {
         std::vector<OvKVCacheBlockKey> keys;
         std::vector<std::size_t> kv_index;             // by KV block: where its key is in `keys`
@@ -273,7 +273,7 @@ private:
     /// when the provider cannot open it (@p error says why).
     const OpenNamespace* session_namespace(const std::string& scope, std::string& error);
 
-    /// Sets the request's read and write namespaces from its policy's scope (I6); opens a session namespace on first use.
+    /// Sets the request's read and write namespaces from its policy's scope; opens a session namespace on first use.
     void select_namespaces(RequestState& state, const PromptCachePolicy& policy);
 
     /// @return How the request's blocks are written, from the engine trigger and the request's policy.
@@ -376,7 +376,7 @@ private:
     std::shared_ptr<StoreProvider> m_provider;
     StoreProvider::BlockLayout m_block_layout;  // what every store is told at open
     OpenNamespace m_shared;
-    // session scopes (I6), by scope key; entries are never removed, so their addresses stay valid
+    // session scopes, by scope key; entries are never removed, so their addresses stay valid
     std::mutex m_sessions_mutex;
     std::map<std::string, std::unique_ptr<OpenNamespace>> m_sessions;
     std::atomic<bool> m_reported_session_failure{false};

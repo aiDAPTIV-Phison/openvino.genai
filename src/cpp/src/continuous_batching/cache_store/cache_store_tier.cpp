@@ -127,7 +127,7 @@ CacheStoreTier::CacheStoreTier(const CacheStoreConfig& config,
 
 CacheStoreTier::~CacheStoreTier() {
     m_orchestrator->set_overwrite_observer(nullptr);
-    // the device cache still exists: what on_evict still holds there is written now (interpretation I10)
+    // the device cache still exists: what on_evict still holds there is written now
     write_back_cached_blocks();
     m_io_pool.drain();
     // every batch is submitted now; the completion thread waits for the last ones to reach a terminal status
@@ -268,11 +268,11 @@ void CacheStoreTier::select_namespaces(RequestState& state, const PromptCachePol
 
 CacheStoreTier::WriteMode CacheStoreTier::write_mode_of(const PromptCachePolicy& policy) const {
     if (policy.is_explicit_only()) {
-        return WriteMode::None;  // I7: an explicit-only request is written by push_cache only
+        return WriteMode::None;  // an explicit-only request is written by push_cache only
     }
     switch (m_config.write.device_to_store.trigger) {
     case WriteTrigger::Immediate:
-        return policy.opt_out_write_through ? WriteMode::OnEvict : WriteMode::Immediate;  // I8: opt-out downgrades
+        return policy.opt_out_write_through ? WriteMode::OnEvict : WriteMode::Immediate;  // opt-out downgrades
     case WriteTrigger::OnAccessSelective:
         return policy.opt_out_write_through ? WriteMode::OnEvict : WriteMode::OnAccess;
     case WriteTrigger::OnEvict:
@@ -285,7 +285,7 @@ CacheStoreTier::WriteMode CacheStoreTier::write_mode_of(const PromptCachePolicy&
 
 std::future<PushCacheOutcome> CacheStoreTier::expect_push(std::uint64_t request_id) {
     auto push = std::make_shared<PushTracker>();
-    push->outcome.epoch = ++m_push_epoch;  // I12
+    push->outcome.epoch = ++m_push_epoch;
     std::future<PushCacheOutcome> outcome = push->promise.get_future();
     std::lock_guard<std::mutex> lock(m_expected_mutex);
     m_expected[request_id].push = std::move(push);
@@ -635,7 +635,7 @@ std::optional<CacheStoreTier::Discovery> CacheStoreTier::discover(RequestState& 
     }
     state.identity.extend(group, *group[0], num_complete);
 
-    // One probe per namespace with the prompt's whole key chain, from its first block and in order (FINDINGS 7.4):
+    // One probe per namespace with the prompt's whole key chain, from its first block and in order:
     // a store may rely on that order. A paged channel reaches the end of the run of present blocks, a whole-state
     // channel the largest present checkpoint below it (guide section 14.4); one probe answers both.
     Discovery found;
@@ -647,7 +647,7 @@ std::optional<CacheStoreTier::Discovery> CacheStoreTier::discover(RequestState& 
         layout = key_chain(state, *ns, num_complete);
         bool probed = false;
         probes.emplace_back(ns, probe(state, *ns, layout->keys, probed, found.probe_failure));
-        // each block from the first namespace that holds it, in the request's order of preference (I6)
+        // each block from the first namespace that holds it, in the request's order of preference
         for (std::size_t block = 0; block < num_complete; ++block) {
             if (!found.kv_source[block] && probes.back().second[layout->kv_index[block]]) {
                 found.kv_source[block] = ns;
@@ -1026,7 +1026,7 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
     state.identity.extend(group, *sequence, end_block);
 
     const PromptCachePolicy& policy = group.get_sampling_parameters().prompt_cache;
-    // One batch for the request: its blocks in order, each state right after the KV block it ends in (FINDINGS 7.4)
+    // One batch for the request: its blocks in order, each state right after the KV block it ends in
     auto batch = std::make_shared<WriteBatch>();
     batch->store = ns.store;
     batch->root = ns.root;
@@ -1291,7 +1291,7 @@ void CacheStoreTier::wait_for_writes() {
 
 void CacheStoreTier::run_write_batch(const std::shared_ptr<WriteBatch>& batch) {
     // The store is probed with the sequence's keys from its first block, in order, before every write: a store that
-    // keeps sequences learns where the blocks belong (FINDINGS 7.4), and a block the reload never probed (e.g. of
+    // keeps sequences learns where the blocks belong, and a block the reload never probed (e.g. of
     // generated tokens) is written only if the store does not hold its key.
     std::vector<bool> skipped(batch->blocks.size(), false);
     if (batch->store->can_probe()) {

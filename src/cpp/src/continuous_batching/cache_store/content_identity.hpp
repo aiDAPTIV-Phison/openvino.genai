@@ -59,7 +59,7 @@ Digest128 compute_witness_digest(const SipHash128::Key& witness_key,
 
 /**
  * @brief Content identity of one sequence, computed by the host from its tokens (or embeddings) block by block and
- * cached as the sequence grows (ARCHITECTURE.md §5):
+ * cached as the sequence grows:
  * - `D[b]`, a MurmurHash3 digest of block b's content;
  * - `W[b]`, a SipHash chain keyed with the host-private key over the raw content (the witness chain);
  * - `C[b]`, a MurmurHash3 chain over `D[b]` per namespace root, from which block keys are derived.
