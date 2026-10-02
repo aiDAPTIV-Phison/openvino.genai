@@ -292,6 +292,21 @@ public:
         m_cache_orchestrator.reset();
     }
 
+    /**
+     * Sizes a dynamically allocated cache for the given requests. schedule() does this itself; a caller that
+     * allocates blocks for these requests before schedule() (the cache store's reload) calls it first.
+     */
+    void reserve_capacity(const std::vector<SequenceGroup::Ptr>& sequence_groups) {
+        if (!m_cache_orchestrator->has_token_capacity()) {
+            _initialize_cache(sequence_groups);
+        } else if (m_dynamic_memory_allocation) {
+            // Cache already initialized and growing dynamically: make sure a newly-arrived prompt
+            // has its capacity (on top of running sequences) reserved in one reallocation rather
+            // than growing in small chunks across the prefill.
+            _reserve_dynamic_capacity_for_active_sequences(sequence_groups);
+        }
+    }
+
     Output schedule(std::vector<SequenceGroup::Ptr>& sequence_groups) {
         _validate_linear_attention_paging_modes(sequence_groups);
 
@@ -304,14 +319,7 @@ public:
         // free some blocks taken by non-confirmed candidates in SD / prompt look-up
         clean_empty_blocks(sequence_groups);
 
-        if (!m_cache_orchestrator->has_token_capacity()) {
-            _initialize_cache(sequence_groups);
-        } else if (m_dynamic_memory_allocation) {
-            // Cache already initialized and growing dynamically: make sure a newly-arrived prompt
-            // has its capacity (on top of running sequences) reserved in one reallocation rather
-            // than growing in small chunks across the prefill.
-            _reserve_dynamic_capacity_for_active_sequences(sequence_groups);
-        }
+        reserve_capacity(sequence_groups);
 
         if (m_config.dynamic_split_fuse) {
             // deepspeed-mii case

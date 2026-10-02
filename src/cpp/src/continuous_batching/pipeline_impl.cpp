@@ -576,7 +576,9 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
 
     _pull_awaiting_requests();
     // Reloads verified since the last step get their device blocks before scheduling sees the requests
-    if (m_cache_store) {
+    if (m_cache_store && !m_requests.empty()) {
+        // a dynamically sized cache has no blocks for a new request until the scheduler reserves them
+        m_scheduler->reserve_capacity(m_requests);
         m_cache_store->allocate_reloads(m_requests);
     }
     _validate_linear_verifier_constraints();
