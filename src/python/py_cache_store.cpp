@@ -53,7 +53,7 @@ auto prompt_cache_policy_docstring = R"(
                  push_cache).
     :param scope: SharedScope() or SessionScope(session_id): the namespace the request writes to; a session request
                   also reuses shared blocks.
-    :param ttl: CacheTtl.standard() (one hour), CacheTtl.seconds(n) or CacheTtl.unlimited().
+    :param ttl: CacheTtl.unlimited() (the default), CacheTtl.standard() (one hour) or CacheTtl.seconds(n).
     :param opt_out_write_through: persist this request's blocks only when they are evicted from the device.
 )";
 

@@ -55,7 +55,7 @@ using PromptCacheScope = std::variant<SharedScope, SessionScope>;
 /** @brief Time-to-live of the store entries a request writes; an expired entry is a cache miss. */
 class CacheTtl {
 public:
-    /** @return The default time-to-live, one hour. */
+    /** @return A time-to-live of one hour. */
     static CacheTtl standard() {
         return CacheTtl(3600);
     }
@@ -91,11 +91,12 @@ private:
 };
 
 /** @brief Request-level prompt cache policy. Always present and always valid; the default is implicit caching in the
- * shared scope with the standard time-to-live. It has an effect only when the pipeline has a cache store. */
+ * shared scope without expiry. It has an effect only when the pipeline has a cache store. */
 struct PromptCachePolicy {
     PromptCacheMode mode = ImplicitCache{};
     PromptCacheScope scope = SharedScope{};
-    CacheTtl ttl = CacheTtl::standard();
+    /** How long the blocks this request stores stay valid. They do not expire unless a time-to-live is set. */
+    CacheTtl ttl = CacheTtl::unlimited();
     /** Opt this request out of write-through: its blocks are persisted only when they are evicted from the device. */
     bool opt_out_write_through = false;
 
