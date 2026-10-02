@@ -356,8 +356,9 @@ StoreProvider::OpenedStore StoreProvider::open(const std::vector<std::uint8_t>& 
     options.property_count = properties.size();
     std::vector<OvKVCacheGroupInfo> groups;
     groups.reserve(layout.groups.size());
-    for (const auto& [group, block_bytes] : layout.groups) {
-        groups.push_back({group.data(), static_cast<std::uint32_t>(group.size()), 0, block_bytes});
+    for (const BlockLayout::Group& group : layout.groups) {
+        groups.push_back({group.name.data(), static_cast<std::uint32_t>(group.name.size()), group.block_tokens,
+                          group.block_bytes});
     }
     options.groups = groups.empty() ? nullptr : groups.data();
     options.group_count = groups.size();

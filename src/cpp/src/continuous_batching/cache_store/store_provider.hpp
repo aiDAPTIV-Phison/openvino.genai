@@ -115,8 +115,13 @@ public:
 
     /** @brief What the host tells a store at `open` about the blocks it will pass (store ABI 1.1). */
     struct BlockLayout {
-        /** Name and block size in bytes of every channel group. */
-        std::vector<std::pair<std::string, std::uint64_t>> groups;
+        struct Group {
+            std::string name;
+            std::uint32_t block_tokens = 0;
+            std::uint64_t block_bytes = 0;
+        };
+        /** Name and block size, in tokens and bytes, of every channel group. */
+        std::vector<Group> groups;
         /** Largest witness of a write. */
         std::uint64_t witness_bytes_max = 0;
     };

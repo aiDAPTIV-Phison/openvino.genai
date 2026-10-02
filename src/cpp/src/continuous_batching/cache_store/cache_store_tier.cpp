@@ -109,7 +109,8 @@ CacheStoreTier::CacheStoreTier(const CacheStoreConfig& config,
       m_io_pool(config.io_threads) {
     m_block_layout.witness_bytes_max = WitnessRecord::SIZE;
     for (const StoreChannel& channel : m_channels) {
-        m_block_layout.groups.emplace_back(channel.group, channel.block_bytes);
+        m_block_layout.groups.push_back(
+            {channel.group, static_cast<std::uint32_t>(channel.block_size_tokens), channel.block_bytes});
         if (channel.cache_type == CacheType::KV_CACHE) {
             m_kv_channel = &channel;
         } else if (channel.cache_type == CacheType::LINEAR_ATTENTION_CACHE) {
@@ -238,10 +239,21 @@ void CacheStoreTier::on_add_request(const SequenceGroup::Ptr& group) {
     // on_access_selective: the complete blocks the device cache supplied are the ones proven reused
     state->reused_blocks = group->get_num_processed_tokens() / block_size;
     plan_reload(*state);
+    if (!state->reload) {
+        log_cache_hits(*group);  // nothing comes from the store: the processed-token count is final
+    }
 
     const std::uint64_t seq_id = (*group)[0]->get_id();
     std::lock_guard<std::mutex> lock(m_requests_mutex);
     m_requests[seq_id] = std::move(state);
+}
+
+void CacheStoreTier::log_cache_hits(const SequenceGroup& group) {
+    const CacheDiagnostics& diagnostics = group.get_cache_diagnostics();
+    GENAI_INFO("Input: " + std::to_string(group.get_prompt_len()) + " tokens ; Cache Hit: (GPU): " +
+               std::to_string(diagnostics.device_hit_tokens) + ", (Connector): " +
+               std::to_string(diagnostics.store_hit_tokens) + ", Processed: " +
+               std::to_string(group.get_num_processed_tokens()));
 }
 
 void CacheStoreTier::select_namespaces(RequestState& state, const PromptCachePolicy& policy) {
@@ -820,6 +832,7 @@ void CacheStoreTier::allocate_reloads(const std::vector<SequenceGroup::Ptr>& req
             !m_orchestrator->can_allocate_tokens(group, additional_tokens)) {
             diagnostics.miss_reason = "the device cache has no room for the reloaded blocks";
             state->reload.reset();
+            log_cache_hits(*group);
             continue;
         }
         // The pipeline's own decision, never a count from the provider (guide section 11, step 7)
@@ -831,6 +844,7 @@ void CacheStoreTier::allocate_reloads(const std::vector<SequenceGroup::Ptr>& req
         state->write_cursor = std::max(state->write_cursor, (plan.target_tokens + block_size - 1) / block_size);
         plan.allocated = true;
         m_pending_uploads.push_back(seq_id);
+        log_cache_hits(*group);
     }
 }
 
@@ -923,14 +937,6 @@ void CacheStoreTier::on_free_sequence(std::uint64_t seq_id) {
     case WriteMode::None:
         break;
     }
-    const CacheDiagnostics& diagnostics = state->group->get_cache_diagnostics();
-    GENAI_INFO("Cache store: request " + std::to_string(state->group->get_request_id()) + ": prompt " +
-               std::to_string(diagnostics.prompt_tokens) + " tokens, device hit " +
-               std::to_string(diagnostics.device_hit_tokens) + ", store hit " +
-               std::to_string(diagnostics.store_hit_tokens) + ", blocks read " +
-               std::to_string(diagnostics.store_read_blocks) + ", blocks queued for writing " +
-               std::to_string(diagnostics.pushed_blocks) +
-               (diagnostics.miss_reason.empty() ? "" : "; " + diagnostics.miss_reason));
     finish_expected(*state);
 }
 

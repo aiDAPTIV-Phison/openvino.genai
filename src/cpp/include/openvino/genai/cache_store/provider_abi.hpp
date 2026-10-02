@@ -322,8 +322,8 @@ typedef struct OvKVCacheProperty {
     const char* value;
 } OvKVCacheProperty;
 
-/// Since 1.1. Byte size of the blocks of one cache group in the namespace being
-/// opened. The host lists every group it will use on the store instance, one
+/// Since 1.1. Size of the blocks of one cache group in the namespace being
+/// opened, in bytes and in tokens. The host lists every group it will use on the store instance, one
 /// entry per group, so a future cache kind is one more entry. The sizes are
 /// fixed for the namespace. A plugin may reject a key of an unlisted group, or
 /// a write whose `bytes` differs from `block_bytes`, with
@@ -331,7 +331,11 @@ typedef struct OvKVCacheProperty {
 typedef struct OvKVCacheGroupInfo {
     const char* group;     ///< same bytes as `OvKVCacheBlockKey::group`; borrowed for the call
     uint32_t group_len;
-    uint32_t reserved0;
+    /// Tokens one block of this group covers; for a state group, the interval
+    /// between its checkpoints (so its ratio to the first group's value is the
+    /// number of first-group blocks per checkpoint). 0 = not given. For
+    /// reporting only: content identity stays the host's.
+    uint32_t block_tokens;
     uint64_t block_bytes;  ///< exact `bytes` of every read and write of this group
 } OvKVCacheGroupInfo;
 
