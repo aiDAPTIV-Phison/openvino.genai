@@ -923,6 +923,14 @@ void CacheStoreTier::on_free_sequence(std::uint64_t seq_id) {
     case WriteMode::None:
         break;
     }
+    const CacheDiagnostics& diagnostics = state->group->get_cache_diagnostics();
+    GENAI_INFO("Cache store: request " + std::to_string(state->group->get_request_id()) + ": prompt " +
+               std::to_string(diagnostics.prompt_tokens) + " tokens, device hit " +
+               std::to_string(diagnostics.device_hit_tokens) + ", store hit " +
+               std::to_string(diagnostics.store_hit_tokens) + ", blocks read " +
+               std::to_string(diagnostics.store_read_blocks) + ", blocks queued for writing " +
+               std::to_string(diagnostics.pushed_blocks) +
+               (diagnostics.miss_reason.empty() ? "" : "; " + diagnostics.miss_reason));
     finish_expected(*state);
 }
 
