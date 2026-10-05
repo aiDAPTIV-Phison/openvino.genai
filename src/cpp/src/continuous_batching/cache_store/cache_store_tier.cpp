@@ -66,6 +66,15 @@ std::unique_ptr<CacheStoreTier> CacheStoreTier::create(const SchedulerConfig& co
                         "The cache store's staging_bytes (", store_config.staging_bytes, ") cannot hold one '",
                         channel.group, "' block of this model (", channel.block_bytes, " bytes)");
     }
+    if (channels.size() > 1) {
+        std::size_t together = 0;
+        for (const StoreChannel& channel : channels) {
+            together += channel.block_bytes;
+        }
+        OPENVINO_ASSERT(together <= store_config.staging_bytes,
+                        "The cache store's staging_bytes (", store_config.staging_bytes, ") cannot hold one block of "
+                        "each cache of this model together (", together, " bytes)");
+    }
     std::filesystem::path models_path;
     const auto models_path_it = properties.find(ov::cache_model_path.name());
     if (models_path_it != properties.end()) {
@@ -434,11 +443,15 @@ std::vector<bool> CacheStoreTier::probe(RequestState& state,
     }
     std::vector<std::uint8_t> out_present(keys.size(), 0);
     OvKVCacheStatus status = OV_KVCACHE_OK;
-    m_io_pool
-        .submit([&] {
-            status = ns.store->has_blocks(keys.data(), out_present.data(), keys.size());
-        })
-        .get();
+    if (ns.store->is_async()) {
+        m_io_pool
+            .submit([&] {
+                status = ns.store->has_blocks(keys.data(), out_present.data(), keys.size());
+            })
+            .get();
+    } else {
+        status = ns.store->has_blocks(keys.data(), out_present.data(), keys.size());
+    }
     state.group->get_cache_diagnostics().store_probed_keys += keys.size();
     if (status != OV_KVCACHE_OK && failure.empty()) {
         failure = "has_blocks returned " + status_to_string(status);
@@ -458,9 +471,13 @@ std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& r
         item.request.target.bytes = item.channel->block_bytes;
         item.request.witness_out = {item.witness.data(), item.witness.size()};
     }
-    // Batches of consecutive items of one namespace, one per I/O thread; each is an in-order run of the sequence, and
-    // a state stays in the call of the KV block it ends in
-    const std::size_t batch_size = std::max<std::size_t>(1, (reads.size() + m_config.io_threads - 1) / m_config.io_threads);
+    const bool is_async = std::all_of(reads.begin(), reads.end(), [](const BlockRead& item) {
+        return item.ns->store->is_async();
+    });
+    // Batches of consecutive items of one namespace (for an asynchronous store one per I/O thread); each is an in-order
+    // run of the sequence, and a state stays in the call of the KV block it ends in
+    const std::size_t batch_size =
+        is_async ? std::max<std::size_t>(1, (reads.size() + m_config.io_threads - 1) / m_config.io_threads) : reads.size();
     std::vector<std::pair<std::size_t, std::size_t>> batches;
     for (std::size_t start = 0; start < reads.size();) {
         std::size_t end = start + 1;
@@ -473,22 +490,9 @@ std::size_t CacheStoreTier::fetch(RequestState& state, std::vector<BlockRead>& r
     }
 
     std::size_t degraded = 0;
-    const bool is_async = std::all_of(reads.begin(), reads.end(), [](const BlockRead& item) {
-        return item.ns->store->is_async();
-    });
     if (!is_async) {
-        std::vector<std::uint8_t> batch_degraded(batches.size(), 0);
-        std::vector<std::future<void>> done;
-        for (std::size_t b = 0; b < batches.size(); ++b) {
-            done.push_back(m_io_pool.submit([this, &reads, &batches, &batch_degraded, b] {
-                batch_degraded[b] = read_batch(reads, batches[b].first, batches[b].second) ? 1 : 0;
-            }));
-        }
-        for (std::future<void>& batch : done) {
-            batch.get();
-        }
-        for (std::uint8_t batch : batch_degraded) {
-            degraded += batch;
+        for (const auto& [start, end] : batches) {
+            degraded += read_batch(reads, start, end) ? 1 : 0;
         }
         for (BlockRead& item : reads) {
             item.failure = verify(state, item);
@@ -696,15 +700,12 @@ std::optional<CacheStoreTier::Discovery> CacheStoreTier::discover(RequestState& 
 void CacheStoreTier::plan_reload(RequestState& state) {
     SequenceGroup& group = *state.group;
     CacheDiagnostics& diagnostics = group.get_cache_diagnostics();
-    const std::size_t block_size = m_kv_channel->block_size_tokens;
     const std::size_t device_tokens = group.get_num_processed_tokens();
     const std::optional<Discovery> found = discover(state, device_tokens);
     if (!found) {
         return;
     }
-    const std::size_t first_block = device_tokens / block_size;
-    const std::size_t num_complete = group.get_prompt_len() / block_size;
-    std::size_t position = found->position;
+    const std::size_t num_complete = group.get_prompt_len() / m_kv_channel->block_size_tokens;
     // A block one of the request's namespaces holds is not written again: a session that extends a shared prefix
     // stores only its own part
     state.kv_writes.assign(num_complete, StoreWrite::Always);
@@ -713,101 +714,163 @@ void CacheStoreTier::plan_reload(RequestState& state) {
             state.kv_writes[block] = StoreWrite::Never;
         }
     }
-    if (position <= device_tokens) {
+    if (found->position <= device_tokens) {
         diagnostics.miss_reason =
             found->probe_failure.empty() ? "not in the store" : "the store is unavailable: " + found->probe_failure;
         return;
     }
-    // Fetch into staging, each block from the namespace its probe found it in: the KV blocks in order, then the state
-    // at the end, right after the KV block it ends in
-    const std::size_t num_blocks = (position + block_size - 1) / block_size;
-    std::vector<BlockRead> reads;
-    reads.reserve(num_blocks - first_block + 1);
-    for (std::size_t block = first_block; block < num_blocks; ++block) {
-        BlockRead item;
-        item.channel = m_kv_channel;
-        item.ns = found->kv_source[block];
-        item.block = block;
-        item.payload = m_staging.try_acquire(m_kv_channel->block_bytes);
-        if (!item.payload) {
-            break;
-        }
-        item.request.key.hash = state.identity.key(item.ns->root, block, m_kv_channel->group);
-        reads.push_back(std::move(item));
-    }
-    if (m_la_channel) {
-        BlockRead item;
-        item.channel = m_la_channel;
-        item.ns = found->la_source;
-        item.block = position / block_size - 1;
-        item.payload = m_staging.try_acquire(m_la_channel->block_bytes);
-        if (reads.size() < num_blocks - first_block || !item.payload) {
-            diagnostics.miss_reason = "the staging pool cannot hold the reload";
-            return;
-        }
-        item.request.key.hash = state.identity.key(item.ns->root, item.block, m_la_channel->group);
-        reads.push_back(std::move(item));
-    } else if (reads.empty()) {
-        diagnostics.miss_reason = "the staging pool cannot hold the reload";
-        return;
-    }
-    diagnostics.degraded_chunks += fetch(state, reads);
-
-    // A block that fails verification is a miss for itself and everything after it
-    std::size_t verified_blocks = first_block;
-    std::string failure;
-    for (const BlockRead& item : reads) {
-        if (item.result.status == OV_KVCACHE_OK) {
-            diagnostics.store_read_blocks += 1;
-            diagnostics.store_read_bytes += item.result.bytes_read;
-        }
-    }
-    for (const BlockRead& item : reads) {
-        if (item.channel != m_kv_channel) {
-            continue;
-        }
-        if (!item.failure.empty()) {
-            // nothing from here on is trusted: it is written again once recomputed, which repairs the store in one pass
-            failure = item.failure;
-            forget_stored_from(state, item.block * block_size);
-            break;
-        }
-        ++verified_blocks;
-    }
-    if (m_la_channel) {
-        const std::string& la_failure = reads.back().failure;
-        if (!la_failure.empty()) {
-            // A state is stored with the KV block it ends in, so the pair is written again from that block on
-            forget_stored_from(state, position - block_size);
-            failure = failure.empty() ? la_failure : failure;
-        }
-        if (!failure.empty() || verified_blocks < num_blocks) {
-            diagnostics.miss_reason = "verification failed: " + failure;
-            return;  // the only state fetched is the one at the end, so any failure voids the reload
-        }
-    } else {
-        position = std::min(position, verified_blocks * block_size);
-        if (verified_blocks < num_blocks) {
-            diagnostics.miss_reason = failure.empty() ? "the staging pool cannot hold the reload"
-                                                      : "verification stopped the reload: " + failure;
-        }
-        if (position <= device_tokens) {
-            return;
-        }
-    }
-
     auto plan = std::make_unique<ReloadPlan>();
     plan->device_tokens = device_tokens;
-    plan->target_tokens = position;
-    const std::size_t kv_needed = (position + block_size - 1) / block_size - first_block;
-    for (BlockRead& item : reads) {
-        if (item.channel == m_kv_channel && plan->kv_payloads.size() < kv_needed) {
-            plan->kv_payloads.push_back(std::move(item.payload));
-        } else if (item.channel == m_la_channel) {
-            plan->la_payload = std::move(item.payload);
-        }
-    }
+    plan->target_tokens = found->position;
+    plan->kv_source = found->kv_source;
+    plan->la_source = found->la_source;
     state.reload = std::move(plan);
+}
+
+std::vector<StagingLease> CacheStoreTier::acquire_staging(const std::vector<std::size_t>& sizes, bool wait) {
+    while (true) {
+        const std::uint64_t seen = m_staging.release_count();
+        std::vector<StagingLease> leases;
+        for (std::size_t size : sizes) {
+            StagingLease lease = m_staging.try_acquire(size);
+            if (!lease) {
+                break;
+            }
+            leases.push_back(std::move(lease));
+        }
+        if (leases.size() == sizes.size()) {
+            return leases;
+        }
+        // A lease taken here and returned again counts as a release too
+        const std::uint64_t own_releases = leases.size();
+        leases.clear();
+        if (!wait) {
+            return {};
+        }
+        // Space comes back from writes in flight (asynchronous store); the staging size check at creation guarantees
+        // that it is enough once they are done
+        m_staging.wait_for_release(seen + own_releases);
+    }
+}
+
+void CacheStoreTier::restore(RequestState& state) {
+    const SequenceGroup::Ptr& group = state.group;
+    CacheDiagnostics& diagnostics = group->get_cache_diagnostics();
+    ReloadPlan& plan = *state.reload;
+    const std::size_t block_size = m_kv_channel->block_size_tokens;
+    const std::uint64_t seq_id = (*group)[0]->get_id();
+    const std::size_t target = plan.target_tokens;
+    const auto count_reads = [&diagnostics](const std::vector<BlockRead>& reads) {
+        for (const BlockRead& item : reads) {
+            if (item.result.status == OV_KVCACHE_OK) {
+                diagnostics.store_read_blocks += 1;
+                diagnostics.store_read_bytes += item.result.bytes_read;
+            }
+        }
+    };
+
+    // The KV blocks in rounds: read as many as staging holds, verify them, allocate their device blocks and copy them
+    // in. Hybrid models: the state at the target travels with the KV block it ends in, in the same round and call, as
+    // it was written; it is copied into the device cache after scheduling (upload_reloads), which may zero its row
+    // before.
+    const std::size_t num_blocks = (target + block_size - 1) / block_size;
+    const std::size_t state_block = m_la_channel ? target / block_size - 1 : num_blocks;
+    std::size_t block = plan.device_tokens / block_size;
+    std::string failure;
+    while (block < num_blocks && failure.empty()) {
+        std::vector<BlockRead> round;
+        for (std::size_t next = block; next < num_blocks; ++next) {
+            const bool with_state = next == state_block;
+            std::vector<std::size_t> sizes = {m_kv_channel->block_bytes};
+            if (with_state) {
+                sizes.push_back(m_la_channel->block_bytes);
+            }
+            std::vector<StagingLease> payload = acquire_staging(sizes, round.empty());
+            if (payload.empty()) {
+                break;  // staging is full: the next round takes the rest
+            }
+            BlockRead item;
+            item.channel = m_kv_channel;
+            item.ns = plan.kv_source[next];
+            item.block = next;
+            item.payload = std::move(payload[0]);
+            item.request.key.hash = state.identity.key(item.ns->root, next, m_kv_channel->group);
+            round.push_back(std::move(item));
+            if (with_state) {
+                BlockRead state_item;
+                state_item.channel = m_la_channel;
+                state_item.ns = plan.la_source;
+                state_item.block = next;
+                state_item.payload = std::move(payload[1]);
+                state_item.request.key.hash = state.identity.key(state_item.ns->root, next, m_la_channel->group);
+                round.push_back(std::move(state_item));
+            }
+        }
+        diagnostics.degraded_chunks += fetch(state, round);
+        count_reads(round);
+        std::size_t verified = 0;
+        for (BlockRead& item : round) {
+            if (!item.failure.empty()) {
+                // nothing from here on is trusted: it is written again once recomputed, which repairs the store in one
+                // pass (a state is stored with the KV block it ends in, so the pair is written again from that block on)
+                failure = item.failure;
+                forget_stored_from(state, item.block * block_size);
+                break;
+            }
+            if (item.channel == m_kv_channel) {
+                ++verified;
+            } else {
+                plan.la_payload = std::move(item.payload);
+            }
+        }
+        // Hybrid models: without the state at the target no KV block can be used
+        if (verified == 0 || (m_la_channel && !failure.empty())) {
+            break;
+        }
+        // The pipeline's own decision, never a count from the provider (guide section 11, step 7)
+        const std::size_t round_end = std::min(target, (block + verified) * block_size);
+        m_orchestrator->allocate_tokens((*group)[0], group, round_end - group->get_num_processed_tokens(),
+                                        group->get_prompt_len());
+        group->update_processed_tokens_num(round_end);
+        // The cache tensors exist and cover the new blocks, and blocks this allocation evicts are copied out first
+        // (before_block_writes), as scheduling does before its own device writes
+        m_orchestrator->allocate_cache_if_needed();
+        const BlocksPerLayer& kv_table = m_orchestrator->get_kv_block_tables(seq_id)[0];
+        std::vector<BlockTransfer> transfers;
+        for (std::size_t i = 0; i < verified; ++i) {
+            transfers.push_back({static_cast<std::size_t>(kv_table.at(round[i].block)->get_index()),
+                                 round[i].payload.data()});
+        }
+        m_codec.upload(*m_kv_channel, cache_tensors(*m_kv_channel), transfers);
+        block += verified;
+    }
+
+    std::size_t restored = group->get_num_processed_tokens();
+    if (m_la_channel && restored != target) {
+        // The only state read is the one at the target, so any failure voids the restore; the blocks copied in so far
+        // are computed again
+        group->update_processed_tokens_num(plan.device_tokens);
+        diagnostics.miss_reason = "verification failed: " + failure;
+        state.reload.reset();
+        return;
+    }
+    if (!failure.empty()) {
+        diagnostics.miss_reason = "verification stopped the restore: " + failure;
+    }
+    if (restored <= plan.device_tokens) {
+        state.reload.reset();
+        return;
+    }
+    diagnostics.store_hit_tokens = restored - plan.device_tokens;
+    diagnostics.served_by = CacheTier::Store;
+    state.write_cursor = std::max(state.write_cursor, (restored + block_size - 1) / block_size);
+    plan.target_tokens = restored;
+    plan.allocated = true;
+    if (plan.la_payload) {
+        m_pending_uploads.push_back(seq_id);
+    } else {
+        state.reload.reset();
+    }
 }
 
 void CacheStoreTier::allocate_reloads(const std::vector<SequenceGroup::Ptr>& requests) {
@@ -825,25 +888,14 @@ void CacheStoreTier::allocate_reloads(const std::vector<SequenceGroup::Ptr>& req
         if (!state || !state->reload || state->reload->allocated) {
             continue;
         }
-        ReloadPlan& plan = *state->reload;
-        CacheDiagnostics& diagnostics = group->get_cache_diagnostics();
-        const std::size_t additional_tokens = plan.target_tokens - plan.device_tokens;
+        const ReloadPlan& plan = *state->reload;
         if (group->get_num_processed_tokens() != plan.device_tokens ||
-            !m_orchestrator->can_allocate_tokens(group, additional_tokens)) {
-            diagnostics.miss_reason = "the device cache has no room for the reloaded blocks";
+            !m_orchestrator->can_allocate_tokens(group, plan.target_tokens - plan.device_tokens)) {
+            group->get_cache_diagnostics().miss_reason = "the device cache has no room for the restored blocks";
             state->reload.reset();
-            log_cache_hits(*group);
-            continue;
+        } else {
+            restore(*state);
         }
-        // The pipeline's own decision, never a count from the provider (guide section 11, step 7)
-        m_orchestrator->allocate_tokens((*group)[0], group, additional_tokens, group->get_prompt_len());
-        group->update_processed_tokens_num(plan.target_tokens);
-        diagnostics.store_hit_tokens = additional_tokens;
-        diagnostics.served_by = CacheTier::Store;
-        const std::size_t block_size = m_kv_channel->block_size_tokens;
-        state->write_cursor = std::max(state->write_cursor, (plan.target_tokens + block_size - 1) / block_size);
-        plan.allocated = true;
-        m_pending_uploads.push_back(seq_id);
         log_cache_hits(*group);
     }
 }
@@ -856,31 +908,20 @@ void CacheStoreTier::upload_reloads() {
             const auto it = m_requests.find(seq_id);
             state = it == m_requests.end() ? nullptr : it->second.get();
         }
-        if (!state || !state->reload || !m_orchestrator->has_block_table(seq_id)) {
+        if (!state || !state->reload || !state->reload->la_payload || !m_orchestrator->has_block_table(seq_id)) {
             continue;
         }
-        ReloadPlan& plan = *state->reload;
-        const std::size_t block_size = m_kv_channel->block_size_tokens;
-        const BlocksPerLayer& kv_table = m_orchestrator->get_kv_block_tables(seq_id)[0];
-        const std::size_t first_block = plan.device_tokens / block_size;
-        std::vector<BlockTransfer> kv_transfers;
-        for (std::size_t i = 0; i < plan.kv_payloads.size(); ++i) {
-            kv_transfers.push_back({static_cast<std::size_t>(kv_table.at(first_block + i)->get_index()),
-                                    plan.kv_payloads[i].data()});
-        }
-        m_codec.upload(*m_kv_channel, cache_tensors(*m_kv_channel), kv_transfers);
-        if (m_la_channel && plan.la_payload) {
-            // the model continues from the state row of its last processed token
-            const std::size_t la_position = (plan.target_tokens - 1) / m_la_channel->block_size_tokens;
-            const std::size_t la_start = m_orchestrator->get_linear_attention_block_table_logical_start(seq_id);
-            const BlocksPerLayer& la_table = m_orchestrator->get_linear_attention_block_table(seq_id);
-            OPENVINO_ASSERT(la_position >= la_start && la_position - la_start < la_table.size(),
-                            "Cache store: the linear attention row of position ", plan.target_tokens,
-                            " was not allocated for sequence ", seq_id);
-            const std::vector<BlockTransfer> la_transfer = {
-                {static_cast<std::size_t>(la_table[la_position - la_start]->get_index()), plan.la_payload.data()}};
-            m_codec.upload(*m_la_channel, cache_tensors(*m_la_channel), la_transfer);
-        }
+        const ReloadPlan& plan = *state->reload;
+        // the model continues from the state row of its last processed token
+        const std::size_t la_position = (plan.target_tokens - 1) / m_la_channel->block_size_tokens;
+        const std::size_t la_start = m_orchestrator->get_linear_attention_block_table_logical_start(seq_id);
+        const BlocksPerLayer& la_table = m_orchestrator->get_linear_attention_block_table(seq_id);
+        OPENVINO_ASSERT(la_position >= la_start && la_position - la_start < la_table.size(),
+                        "Cache store: the linear attention row of position ", plan.target_tokens,
+                        " was not allocated for sequence ", seq_id);
+        const std::vector<BlockTransfer> la_transfer = {
+            {static_cast<std::size_t>(la_table[la_position - la_start]->get_index()), plan.la_payload.data()}};
+        m_codec.upload(*m_la_channel, cache_tensors(*m_la_channel), la_transfer);
         state->reload.reset();
     }
     m_pending_uploads.clear();
@@ -1031,6 +1072,32 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
     if (first_block >= end_block || !state.write_namespace) {
         return first_block;
     }
+    const bool synchronous = !state.write_namespace->store->is_async();
+    const bool budgeted = within_budget && !synchronous;
+    std::size_t next = first_block;
+    while (next < end_block) {
+        const std::uint64_t seen = m_staging.release_count();
+        const std::size_t reached = write_round(state, next, end_block, budgeted);
+        if (budgeted) {
+            return reached;  // the step budget or the free staging stopped it: the next step continues
+        }
+        if (reached == next) {
+            if (synchronous) {
+                break;  // cannot happen: nothing is in flight, and staging holds a block of each cache
+            }
+            // staging is held by writes in flight: wait until one of them returns its space
+            m_staging.wait_for_release(seen);
+            continue;
+        }
+        next = reached;
+    }
+    return next;
+}
+
+std::size_t CacheStoreTier::write_round(RequestState& state,
+                                        std::size_t first_block,
+                                        std::size_t end_block,
+                                        bool budgeted) {
     const OpenNamespace& ns = *state.write_namespace;
     const SequenceGroup& group = *state.group;
     const Sequence::CPtr sequence = group[0];
@@ -1070,8 +1137,7 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
             }
         }
         const std::size_t bytes = m_kv_channel->block_bytes + (la_row ? m_la_channel->block_bytes : 0);
-        if (within_budget && m_step_copied_bytes > 0 &&
-            m_step_copied_bytes + bytes > m_config.step_transfer_budget_bytes) {
+        if (budgeted && m_step_copied_bytes > 0 && m_step_copied_bytes + bytes > m_config.step_transfer_budget_bytes) {
             break;  // the rest waits for the next step; the sequence keeps its blocks meanwhile
         }
         StagingLease kv_payload = m_staging.try_acquire(m_kv_channel->block_bytes);
@@ -1119,9 +1185,13 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
         std::lock_guard<std::mutex> lock(batch->push->mutex);
         batch->push->pending_batches += 1;
     }
-    m_io_pool.submit([this, batch] {
-        run_write_batch(batch);
-    });
+    if (ns.store->is_async()) {
+        m_io_pool.submit([this, batch] {
+            run_write_batch(batch);
+        });
+    } else {
+        run_write_batch(batch);  // written now; the batch's staging comes back when it goes out of scope
+    }
     return next;
 }
 
@@ -1199,11 +1269,29 @@ std::vector<bool> CacheStoreTier::write_back(const std::vector<std::pair<WriteBa
     std::map<std::tuple<const OpenNamespace*, const KeyChain*, std::uint64_t>, Pending> batches;
     std::vector<bool> queued(blocks.size(), false);
     const std::uint64_t now = unix_seconds_now();
-    for (std::size_t o = 0; o < order.size(); ++o) {
+    // Writes the batches collected so far: now for a synchronous store, through the I/O pool for an asynchronous one
+    const auto flush = [&] {
+        for (auto& [id, pending] : batches) {
+            m_codec.download(*m_kv_channel, cache_tensors(*m_kv_channel), pending.kv_transfers);
+            if (!pending.la_transfers.empty()) {
+                m_codec.download(*m_la_channel, cache_tensors(*m_la_channel), pending.la_transfers);
+            }
+            if (pending.batch->store->is_async()) {
+                m_io_pool.submit([this, batch = pending.batch] {
+                    run_write_batch(batch);
+                });
+            } else {
+                run_write_batch(pending.batch);
+            }
+        }
+        batches.clear();
+    };
+    for (std::size_t o = 0; o < order.size();) {
         const std::size_t i = order[o];
         const WriteBack& block = blocks[i].first;
         if (block.channel != m_kv_channel) {
             queued[i] = true;  // a state whose KV block is not written with it cannot be stored: nothing to retry
+            ++o;
             continue;
         }
         // the state ending in this block, when it is written back too
@@ -1215,14 +1303,19 @@ std::vector<bool> CacheStoreTier::write_back(const std::vector<std::pair<WriteBa
                 la = order[o + 1];
             }
         }
-        StagingLease kv_payload = m_staging.try_acquire(m_kv_channel->block_bytes);
-        StagingLease la_payload = la ? m_staging.try_acquire(m_la_channel->block_bytes) : StagingLease();
-        if (!kv_payload || (la && !la_payload)) {
-            if (la) {
-                ++o;  // the pair is tried again together
-            }
-            continue;
+        std::vector<std::size_t> sizes = {m_kv_channel->block_bytes};
+        if (la) {
+            sizes.push_back(m_la_channel->block_bytes);
         }
+        std::vector<StagingLease> leases = acquire_staging(sizes, false);
+        if (leases.empty()) {
+            // Staging is full: what is collected goes out first, then this block waits for space. It cannot be
+            // deferred, since its device block is overwritten in this step.
+            flush();
+            leases = acquire_staging(sizes, true);
+        }
+        StagingLease kv_payload = std::move(leases[0]);
+        StagingLease la_payload = la ? std::move(leases[1]) : StagingLease();
         const std::uint64_t expires_at = block.ttl_seconds == 0 ? 0 : now + block.ttl_seconds;
         Pending& pending = batches[{block.ns, block.chain.get(), expires_at}];
         if (!pending.batch) {
@@ -1243,18 +1336,10 @@ std::vector<bool> CacheStoreTier::write_back(const std::vector<std::pair<WriteBa
                                              state_block.chain->keys[state_block.chain_index], state_block.chain_index,
                                              state_block.end_position, state_block.witness_chain, state_block.if_absent});
             queued[*la] = true;
-            ++o;
         }
+        o += la ? 2 : 1;
     }
-    for (auto& [id, pending] : batches) {
-        m_codec.download(*m_kv_channel, cache_tensors(*m_kv_channel), pending.kv_transfers);
-        if (!pending.la_transfers.empty()) {
-            m_codec.download(*m_la_channel, cache_tensors(*m_la_channel), pending.la_transfers);
-        }
-        m_io_pool.submit([this, batch = pending.batch] {
-            run_write_batch(batch);
-        });
-    }
+    flush();
     return queued;
 }
 

@@ -146,6 +146,20 @@ void StagingPool::release(std::size_t offset, std::size_t reserved) {
         }
     }
     m_free_bytes += reserved;
+    m_releases += 1;
+    m_released.notify_all();
+}
+
+std::uint64_t StagingPool::release_count() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_releases;
+}
+
+void StagingPool::wait_for_release(std::uint64_t seen) {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    m_released.wait(lock, [this, seen] {
+        return m_releases > seen;
+    });
 }
 
 }  // namespace ov::genai::cache_store

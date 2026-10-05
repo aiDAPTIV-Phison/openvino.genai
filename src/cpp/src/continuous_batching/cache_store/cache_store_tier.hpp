@@ -67,11 +67,13 @@ public:
     /// what the store has beyond the device prefix (discover, verify) into staging. Changes nothing in the device cache.
     void on_add_request(const SequenceGroup::Ptr& group);
 
-    /// Start of a step, after new requests were pulled: allocates the device blocks of the reloads verified since the
-    /// previous step and sets their requests' processed-token counts.
+    /// Start of a step, after new requests were pulled: restores what the store holds for each new request, in rounds
+    /// through the staging pool (read, verify, allocate the device blocks, copy them in), and sets the request's
+    /// processed-token count. Blocks the calling (inference) thread until the restore is done.
     void allocate_reloads(const std::vector<SequenceGroup::Ptr>& requests);
 
-    /// Before `forward`, after scheduling: copies every allocated reload into the device cache (admit).
+    /// Before `forward`, after scheduling: copies the linear attention state of each restore into the device cache
+    /// (scheduling may zero the row first).
     void upload_reloads();
 
     /// After sampling and the linear attention checkpoint commit of a step: writes the blocks the scheduled requests
@@ -114,12 +116,13 @@ private:
         Digest128 root{0, 0};
     };
 
-    /// Verified store blocks waiting in staging to be admitted into the device cache.
+    /// What the probes found for a request, restored when the request is scheduled.
     struct ReloadPlan {
         std::size_t device_tokens = 0;  // prompt tokens the device prefix cache supplied
-        std::size_t target_tokens = 0;  // processed-token count after the reload
-        std::vector<StagingLease> kv_payloads;  // blocks from device_tokens / block size on, in order
-        StagingLease la_payload;                 // linear attention state at target_tokens
+        std::size_t target_tokens = 0;  // processed-token count after the restore
+        std::vector<const OpenNamespace*> kv_source;  // by KV block: the namespace it is read from
+        const OpenNamespace* la_source = nullptr;     // where the state at target_tokens is read from
+        StagingLease la_payload;  // the verified state at target_tokens, copied in after scheduling
         bool allocated = false;
     };
 
@@ -300,17 +303,28 @@ private:
     /// OnAccess: writes the blocks the request reused from the device prefix cache.
     void write_reused_blocks(RequestState& state, bool within_budget);
 
-    /// Copies KV blocks [first_block, end_block) of the request, and the linear attention checkpoints ending in them,
-    /// into staging and queues their writes; what the store holds is skipped (StoreWrite).
+    /// Writes KV blocks [first_block, end_block) of the request, and the linear attention checkpoints ending in them;
+    /// what the store holds is skipped (StoreWrite). A synchronous store is written on the calling (inference) thread,
+    /// in rounds through staging, until all are written, whatever the step budget. An asynchronous store gets them
+    /// through the I/O pool: during a step (@p within_budget) as far as the step budget and the free staging allow;
+    /// otherwise all of them, waiting for staging that writes in flight hold.
     /// @return The first block not handled: end_block, or where the step budget or the staging pool stopped it.
     std::size_t write_blocks(RequestState& state, std::size_t first_block, std::size_t end_block, bool within_budget);
+
+    /// One round of write_blocks: copies blocks into staging until @p budgeted's step budget or the staging pool stops
+    /// it, then writes them (synchronous store) or queues them (asynchronous store). @return The first block not
+    /// handled.
+    std::size_t write_round(RequestState& state, std::size_t first_block, std::size_t end_block, bool budgeted);
+
+    /// Leases of all @p sizes, or none. With @p wait, waits for space that writes in flight hold.
+    std::vector<StagingLease> acquire_staging(const std::vector<std::size_t>& sizes, bool wait);
 
     /// OnEvict: remembers the request's complete blocks and checkpoints, by prefix hash, for write-back on eviction.
     void remember_for_write_back(RequestState& state);
 
-    /// Copies blocks out of the device cache (physical block index each) and queues their writes. Not bound by the step
-    /// budget: an evicted block is overwritten in this step. @return Which blocks were queued; the others found no
-    /// staging space.
+    /// Copies blocks out of the device cache (physical block index each) and writes them (synchronous store) or queues
+    /// their writes. Not bound by the step budget: an evicted block is overwritten in this step, so when staging is
+    /// full this waits for space. @return Which blocks were handled (all).
     std::vector<bool> write_back(const std::vector<std::pair<WriteBack, std::size_t>>& blocks);
 
     /// Destruction: writes back every remembered block still in the device cache, as far as staging allows per round.
@@ -319,9 +333,12 @@ private:
     /// Waits until every queued write is terminal and its staging is free again.
     void wait_for_writes();
 
-    /// Discover and verify (guide section 11): probes the store with the prompt's keys, finds the prefix every channel
-    /// can serve beyond the device prefix, reads it into staging and verifies it.
+    /// Discover (guide section 11): probes the store with the prompt's keys and finds the prefix every channel can serve
+    /// beyond the device prefix. Nothing is read: the request is restored when it is scheduled (allocate_reloads).
     void plan_reload(RequestState& state);
+
+    /// Verify and admit (guide section 11) a scheduled request's plan, in rounds through staging; see allocate_reloads.
+    void restore(RequestState& state);
 
     /// Discover only: probes each of the request's read namespaces with the prompt's key chain and takes each block
     /// from the first namespace that holds it. @return Nothing when the request cannot use the store
@@ -341,7 +358,7 @@ private:
                             std::string& failure);
 
     /// Fetches the items in batches of consecutive blocks and verifies each (sets `failure`). A
-    /// synchronous store reads the batches in parallel on the I/O pool. An asynchronous store gets every batch submitted
+    /// synchronous store is read on the calling thread. An asynchronous store gets every batch submitted
     /// at once from this thread; they are waited for in order, and the first KV block that fails verification cancels
     /// the batches after it, which can no longer be used. @return The number of batches that degraded to per-block
     /// reads.

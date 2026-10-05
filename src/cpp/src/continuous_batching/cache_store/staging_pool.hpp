@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -77,6 +78,12 @@ public:
 
     std::size_t free_bytes() const;
 
+    /** @return How many leases were returned so far; with wait_for_release, a wait for space without missing a release. */
+    std::uint64_t release_count() const;
+
+    /** @brief Blocks until more than @p seen leases have been returned in total. */
+    void wait_for_release(std::uint64_t seen);
+
 private:
     friend class StagingLease;
     void release(std::size_t offset, std::size_t reserved);
@@ -86,6 +93,8 @@ private:
     mutable std::mutex m_mutex;
     std::map<std::size_t, std::size_t> m_free_ranges;  // offset -> length, coalesced
     std::size_t m_free_bytes = 0;
+    std::uint64_t m_releases = 0;
+    std::condition_variable m_released;
 };
 
 }  // namespace ov::genai::cache_store
