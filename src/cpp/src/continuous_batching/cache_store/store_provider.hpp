@@ -80,33 +80,24 @@ private:
 };
 
 /**
- * @brief A store provider selected from a module that passed the handshake: a plugin library, or the built-in "file"
- * provider. Modules are loaded once and never unloaded, and provider instances are never destroyed, because several
- * pipelines of the process may use them.
+ * @brief A store provider selected from a plugin library that passed the handshake. Modules are loaded once and never
+ * unloaded, and provider instances are never destroyed, because several pipelines of the process may use them.
  */
 class StoreProvider {
 public:
     /**
-     * @brief Loads `config.library_path` (or takes the built-in module when it is empty), checks the handshake and
-     * selects `config.provider`. Never throws for a plugin problem: when anything fails it logs a warning and returns
-     * the built-in "file" provider. @p fallback_reason receives the reason, empty when no fallback happened.
+     * @brief Loads `config.library_path`, checks the handshake and selects `config.provider`. Never throws for a plugin
+     * problem. @return The provider, or nullptr when anything fails; @p error then receives the reason.
      */
-    static std::shared_ptr<StoreProvider> create(const CacheStoreConfig& config, std::string& fallback_reason);
-
-    /** @return The built-in "file" provider. */
-    static std::shared_ptr<StoreProvider> create_builtin();
+    static std::shared_ptr<StoreProvider> create(const CacheStoreConfig& config, std::string& error);
 
     const std::string& name() const {
         return m_name;
     }
 
-    /** @return The library the provider came from, or "built-in". */
+    /** @return The library the provider came from. */
     const std::string& origin() const {
         return m_origin;
-    }
-
-    bool is_builtin() const {
-        return m_is_builtin;
     }
 
     OvKVCacheCapabilities capabilities() const {
@@ -149,12 +140,11 @@ public:
     OvKVCacheStatus register_host_memory(void* base, std::uint64_t bytes) const;
 
 private:
-    StoreProvider(const OvKVCacheStoreProviderDescriptor* descriptor, std::string name, std::string origin, bool is_builtin);
+    StoreProvider(const OvKVCacheStoreProviderDescriptor* descriptor, std::string name, std::string origin);
 
     const OvKVCacheStoreProviderDescriptor* m_descriptor;
     std::string m_name;
     std::string m_origin;
-    bool m_is_builtin;
     OvKVCacheCapabilities m_capabilities;
 };
 

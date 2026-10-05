@@ -26,21 +26,23 @@ namespace {
 
 auto cache_store_config_docstring = R"(
     Cache store tier of the continuous batching pipeline: persists KV cache blocks through a store provider (a plugin
-    library implementing the KV cache store C ABI, or the built-in "file" provider) and serves them back to later
-    requests, also across process restarts. Set it as SchedulerConfig.cache_store.
+    library implementing the KV cache store C ABI) and serves them back to later requests, also across process
+    restarts. Set it as SchedulerConfig.cache_store. A provider that fails to load or open disables the tier with a
+    warning.
 
     :param enable: master switch of the store tier.
-    :param directory: location passed to the provider's open; required by the built-in "file" provider.
+    :param directory: location passed to the provider's open.
     :param capacity_bytes: capacity budget passed to the provider's open; 0 lets the provider decide.
-    :param provider: provider name to select from the module, e.g. "file"; empty selects the first one.
-    :param library_path: path of the plugin library; empty selects the built-in "file" provider.
+    :param provider: provider name to select from the module; empty selects the first one.
+    :param library_path: path of the plugin library; required.
     :param staging_bytes: size of the host staging pool every store transfer goes through.
     :param io_threads: number of host I/O threads calling the provider.
     :param durability: CacheStoreConfig.Durability.Relaxed or Strict.
     :param verify_key_tokens: verify blocks read back against their tokens; must stay True.
     :param verify_payload_crc: also store and verify a checksum of every block (default True: the witness proves the
                                block's identity, not the integrity of its bytes).
-    :param step_transfer_budget_bytes: bytes copied between device cache and staging for store writes per step.
+    :param step_transfer_budget_bytes: bytes copied between device cache and staging for store writes per step, for
+                                       a provider with asynchronous I/O (a synchronous one blocks until written).
     :param write: engine-level write policy, write.device_to_store.trigger and write.host_to_store.trigger.
     :param properties: provider settings as a dict of strings; assign a whole dict, items of the returned copy cannot
                        be changed in place.

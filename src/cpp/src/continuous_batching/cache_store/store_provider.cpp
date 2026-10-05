@@ -10,7 +10,6 @@
 #include <mutex>
 #include <tuple>
 
-#include "continuous_batching/cache_store/file_provider.hpp"
 #include "gguf_utils/gguf_tokenizer.hpp"
 #include "logger.hpp"
 #include "openvino/genai/cache_store/sdk_fingerprint.h"
@@ -243,38 +242,20 @@ OvKVCacheStatus StoreInstance::cancel(OvKVCacheAsyncToken token) const {
     return m_vtable->cancel(m_store, token);
 }
 
-StoreProvider::StoreProvider(const OvKVCacheStoreProviderDescriptor* descriptor,
-                             std::string name,
-                             std::string origin,
-                             bool is_builtin)
+StoreProvider::StoreProvider(const OvKVCacheStoreProviderDescriptor* descriptor, std::string name, std::string origin)
     : m_descriptor(descriptor),
       m_name(std::move(name)),
       m_origin(std::move(origin)),
-      m_is_builtin(is_builtin),
       m_capabilities(descriptor->capabilities) {}
 
-std::shared_ptr<StoreProvider> StoreProvider::create_builtin() {
-    const OvKVCacheStoreModuleInfo* info = builtin_file_store_module();
-    const std::string module_error = check_module(info);
-    OPENVINO_ASSERT(module_error.empty(), "Built-in cache store module: ", module_error);
-    const OvKVCacheStoreProviderDescriptor* descriptor = info->get_provider(0);
-    const std::string provider_error = check_provider(descriptor);
-    OPENVINO_ASSERT(provider_error.empty(), "Built-in cache store provider: ", provider_error);
-    return std::shared_ptr<StoreProvider>(new StoreProvider(descriptor, descriptor_name(*descriptor), "built-in", true));
-}
-
-std::shared_ptr<StoreProvider> StoreProvider::create(const CacheStoreConfig& config, std::string& fallback_reason) {
-    fallback_reason.clear();
-    if (config.uses_builtin_provider()) {
-        return create_builtin();
-    }
-
+std::shared_ptr<StoreProvider> StoreProvider::create(const CacheStoreConfig& config, std::string& error) {
+    error.clear();
     try {
         std::shared_ptr<void> library = load_module_library(config.library_path);
         const auto entry = reinterpret_cast<EntryFunction>(get_symbol(library, OV_KVCACHE_STORE_ENTRY_SYMBOL));
         const OvKVCacheStoreModuleInfo* info = entry();
-        fallback_reason = check_module(info);
-        if (fallback_reason.empty()) {
+        error = check_module(info);
+        if (error.empty()) {
             const OvKVCacheStoreProviderDescriptor* selected = nullptr;
             for (std::uint32_t index = 0; index < info->provider_count && !selected; ++index) {
                 const OvKVCacheStoreProviderDescriptor* descriptor = info->get_provider(index);
@@ -284,22 +265,19 @@ std::shared_ptr<StoreProvider> StoreProvider::create(const CacheStoreConfig& con
                 }
             }
             if (!selected) {
-                fallback_reason = "the module has no provider named '" + config.provider + "'";
+                error = "the module has no provider named '" + config.provider + "'";
             } else {
-                fallback_reason = check_provider(selected);
-                if (fallback_reason.empty()) {
+                error = check_provider(selected);
+                if (error.empty()) {
                     return std::shared_ptr<StoreProvider>(
-                        new StoreProvider(selected, descriptor_name(*selected), config.library_path, false));
+                        new StoreProvider(selected, descriptor_name(*selected), config.library_path));
                 }
             }
         }
-    } catch (const std::exception& error) {
-        fallback_reason = error.what();
+    } catch (const std::exception& exception) {
+        error = exception.what();
     }
-
-    GENAI_WARN("Cache store provider '" + config.provider + "' from " + config.library_path +
-               " cannot be used: " + fallback_reason + ". Falling back to the built-in \"file\" provider.");
-    return create_builtin();
+    return nullptr;
 }
 
 namespace {

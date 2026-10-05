@@ -87,8 +87,13 @@ std::unique_ptr<CacheStoreTier> CacheStoreTier::create(const SchedulerConfig& co
         return nullptr;
     }
 
-    std::string fallback_reason;
-    std::shared_ptr<StoreProvider> provider = StoreProvider::create(store_config, fallback_reason);
+    std::string error;
+    std::shared_ptr<StoreProvider> provider = StoreProvider::create(store_config, error);
+    if (!provider) {
+        GENAI_WARN("The cache store is disabled: provider '" + store_config.provider + "' from " +
+                   store_config.library_path + " cannot be used: " + error + ".");
+        return nullptr;
+    }
     std::unique_ptr<CacheStoreTier> tier(
         new CacheStoreTier(store_config, std::move(orchestrator), std::move(channels), fingerprints, std::move(provider)));
     if (!tier->open_namespace(scope_key(SharedScope{}), tier->m_shared)) {
@@ -172,17 +177,10 @@ bool CacheStoreTier::open_namespace(const std::string& scope, OpenNamespace& ope
     opened.scope = scope;
     opened.bytes = make_namespace(scope, m_fingerprints);
     std::string error;
-    StoreProvider::OpenedStore store = m_provider->open(opened.bytes, m_config, m_block_layout, error);
-    if (!store.store && !m_provider->is_builtin()) {
-        GENAI_WARN("Cache store provider '" + m_provider->name() + "' from " + m_provider->origin() +
-                   " failed to open namespace '" + scope + "': " + error +
-                   ". Falling back to the built-in \"file\" provider.");
-        m_provider = StoreProvider::create_builtin();
-        store = m_provider->open(opened.bytes, m_config, m_block_layout, error);
-    }
+    const StoreProvider::OpenedStore store = m_provider->open(opened.bytes, m_config, m_block_layout, error);
     if (!store.store) {
-        GENAI_WARN("The cache store is disabled: the built-in \"file\" provider failed to open namespace '" + scope +
-                   "' in '" + m_config.directory + "': " + error + ".");
+        GENAI_WARN("The cache store is disabled: provider '" + m_provider->name() + "' from " + m_provider->origin() +
+                   " failed to open namespace '" + scope + "' in '" + m_config.directory + "': " + error + ".");
         return false;
     }
     opened.store = store.store;

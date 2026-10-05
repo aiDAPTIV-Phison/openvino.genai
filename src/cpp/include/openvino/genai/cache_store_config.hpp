@@ -53,13 +53,15 @@ inline WriteTrigger write_trigger_from_string(const std::string& name) {
 
 /**
  * @brief Cache store tier: persists KV cache blocks through a store provider (a plugin library implementing
- * openvino/genai/cache_store/provider_abi.hpp, or the built-in "file" provider) and serves them back to later
- * requests, also across process restarts.
+ * openvino/genai/cache_store/provider_abi.hpp) and serves them back to later requests, also across process restarts.
  *
  * The pipeline owns the content identity of every block (tokenization, 128-bit content keys, witnesses), the prefix
  * decision, verification and admission into the device cache; the provider only stores opaque blocks. A provider that
- * fails to load or open is replaced by the built-in "file" provider with a warning, and store failures never abort a
- * request: they make the affected blocks a cache miss.
+ * fails to load or open disables the store tier with a warning, and store failures never abort a request: they make
+ * the affected blocks a cache miss.
+ *
+ * A provider without asynchronous I/O is called on the inference thread, which waits for every transfer; an
+ * asynchronous provider writes in the background.
  */
 struct CacheStoreConfig {
     enum class Durability {
@@ -89,13 +91,13 @@ struct CacheStoreConfig {
 
     /** Master switch of the store tier. */
     bool enable = false;
-    /** On-disk location passed to the provider's `open`. Required by the built-in "file" provider. */
+    /** Location passed to the provider's `open`. */
     std::string directory;
     /** Capacity budget passed to the provider's `open`; 0 lets the provider decide. */
     std::uint64_t capacity_bytes = 0;
-    /** Provider to select from the loaded module, e.g. "file" or "vendor-x"; empty selects the module's first one. */
-    std::string provider = "file";
-    /** Path of the vendor plugin library; empty selects the built-in "file" provider. */
+    /** Provider to select from the loaded module, e.g. "vendor-x"; empty selects the module's first one. */
+    std::string provider;
+    /** Path of the store plugin library. Required. */
     std::string library_path;
     /** Size of the host staging pool every store transfer goes through. */
     std::size_t staging_bytes = 32 * 1024 * 1024;
@@ -110,16 +112,14 @@ struct CacheStoreConfig {
      * damaged bytes under an intact witness is served as a hit. Detects accidental damage, not a deliberate forgery.
      */
     bool verify_payload_crc = true;
-    /** Bytes copied between the device cache and staging for store writes in one pipeline step. */
+    /**
+     * Bytes copied between the device cache and staging for store writes in one pipeline step, for a provider with
+     * asynchronous I/O. A synchronous provider is written in full when the blocks are due.
+     */
     std::size_t step_transfer_budget_bytes = 16 * 1024 * 1024;
     WritePolicy write;
     /** Free-form provider settings, forwarded to the provider's `open` as key / value strings. */
     std::map<std::string, std::string> properties;
-
-    /** @return Whether the built-in "file" provider is selected, i.e. no plugin library is configured. */
-    bool uses_builtin_provider() const {
-        return library_path.empty();
-    }
 
     void validate() const {
         if (!enable) {
@@ -132,12 +132,8 @@ struct CacheStoreConfig {
         OPENVINO_ASSERT(staging_bytes > 0, "CacheStoreConfig staging_bytes must be greater than 0");
         OPENVINO_ASSERT(step_transfer_budget_bytes > 0,
                         "CacheStoreConfig step_transfer_budget_bytes must be greater than 0");
-        if (uses_builtin_provider()) {
-            OPENVINO_ASSERT(provider.empty() || provider == "file",
-                            "CacheStoreConfig provider '", provider,
-                            "' needs a library_path; without one only the built-in \"file\" provider is available");
-            OPENVINO_ASSERT(!directory.empty(), "CacheStoreConfig directory is required by the built-in \"file\" provider");
-        }
+        OPENVINO_ASSERT(!library_path.empty(),
+                        "CacheStoreConfig library_path is required: the store provider is a plugin library");
     }
 
     bool operator==(const CacheStoreConfig& other) const {

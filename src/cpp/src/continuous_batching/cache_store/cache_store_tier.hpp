@@ -49,7 +49,7 @@ public:
     /**
      * @brief Sets up the tier for a pipeline whose cache orchestrator exists.
      * @return The tier, or nullptr when `config.cache_store.enable` is false, or (with a warning) when no store can be
-     * used for this model: it has no folder to fingerprint, or neither the configured nor the built-in provider opens.
+     * used for this model: it has no folder to fingerprint, or the provider fails to load or to open.
      */
     static std::unique_ptr<CacheStoreTier> create(const SchedulerConfig& config,
                                                   std::shared_ptr<CacheOrchestrator> orchestrator,
@@ -269,7 +269,7 @@ private:
                    StoreFingerprints fingerprints,
                    std::shared_ptr<StoreProvider> provider);
 
-    /// Opens the namespace of a scope; when the provider fails, falls back to the built-in "file" provider for good.
+    /// Opens the namespace of a scope. @return false (with a warning) when the provider fails to open it.
     bool open_namespace(const std::string& scope, OpenNamespace& opened);
 
     /// @return The namespace of a session scope, opened on first use (a provider call outside every lock), or nullptr
