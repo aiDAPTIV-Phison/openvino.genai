@@ -52,7 +52,7 @@ std::unique_ptr<CacheStoreTier> CacheStoreTier::create(const SchedulerConfig& co
         return nullptr;
     }
     OPENVINO_ASSERT(config.enable_prefix_caching,
-                    "The cache store requires enable_prefix_caching: stored blocks extend the pipeline's prefix cache");
+                    "The cache store works on the prefix cache's bookkeeping, which the pipeline keeps enabled for it");
     OPENVINO_ASSERT(!config.use_cache_eviction,
                     "The cache store cannot be combined with cache eviction: evicting tokens changes a block after it "
                     "was stored");

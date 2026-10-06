@@ -182,6 +182,13 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(std
     m_device = device;
     SchedulerConfig normalized_config = scheduler_config;
     normalized_config.validate();
+    // A cache store works on the prefix cache's bookkeeping (block hashes, linear attention checkpoints), so that is
+    // kept with a store. Without enable_prefix_caching only the reuse of device blocks by later requests is off:
+    // every cached prefix then comes from the store.
+    m_reuse_device_prefix = normalized_config.enable_prefix_caching;
+    if (normalized_config.cache_store.enable) {
+        normalized_config.enable_prefix_caching = true;
+    }
 
     // Resolve per-role MODEL_PROPERTIES overlay for the language model and
     // strip the GenAI-only MODEL_PROPERTIES meta key before reaching the OV plugin.
@@ -372,7 +379,7 @@ GenerationHandle ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request
         seq->set_accumulate_hidden_states(true);
     }
 
-    if (m_scheduler->get_config().enable_prefix_caching) {
+    if (m_scheduler->get_config().enable_prefix_caching && m_reuse_device_prefix) {
         m_scheduler->restore_cached_blocks(sequence_group);
     }
     CacheDiagnostics& cache_diagnostics = sequence_group->get_cache_diagnostics();

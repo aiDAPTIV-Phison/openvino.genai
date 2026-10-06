@@ -89,8 +89,9 @@ struct SchedulerConfig {
      */
     SparseAttentionConfig sparse_attention_config;
 
-    /** Cache store tier: persists KV cache blocks through a store provider and serves them back to later requests,
-     * also across process restarts. Requires `enable_prefix_caching`.
+    /** Cache store tier: persists KV cache blocks through a store provider and serves them back to later requests.
+     * With `enable_prefix_caching` a request first reuses the blocks still in the device cache; without it every
+     * cached prefix is read from the store.
      */
     CacheStoreConfig cache_store;
 

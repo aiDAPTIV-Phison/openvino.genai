@@ -23,6 +23,8 @@ protected:
     std::shared_ptr<Sampler> m_sampler;
     // Cache store tier (SchedulerConfig::cache_store); null when the store is disabled
     std::unique_ptr<cache_store::CacheStoreTier> m_cache_store;
+    // SchedulerConfig::enable_prefix_caching as configured: whether a new request reuses blocks still in the device cache
+    bool m_reuse_device_prefix = true;
 
     // current requests to process
     std::vector<SequenceGroup::Ptr> m_requests;
