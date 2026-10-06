@@ -257,10 +257,12 @@ void CacheStoreTier::on_add_request(const SequenceGroup::Ptr& group) {
 
 void CacheStoreTier::log_cache_hits(const SequenceGroup& group) {
     const CacheDiagnostics& diagnostics = group.get_cache_diagnostics();
-    GENAI_INFO("Input: " + std::to_string(group.get_prompt_len()) + " tokens ; Cache Hit: (GPU): " +
-               std::to_string(diagnostics.device_hit_tokens) + ", (Connector): " +
-               std::to_string(diagnostics.store_hit_tokens) + ", Processed: " +
-               std::to_string(group.get_num_processed_tokens()));
+    // Written whatever the log level: the line is the per-request report of a pipeline with a cache store
+    Logger::get_instance().do_log(ov::log::Level::INFO, __FILE__, __LINE__,
+                                  "Input: " + std::to_string(group.get_prompt_len()) + " tokens ; Cache Hit: (GPU): " +
+                                      std::to_string(diagnostics.device_hit_tokens) + ", (Connector): " +
+                                      std::to_string(diagnostics.store_hit_tokens) + ", Processed: " +
+                                      std::to_string(group.get_num_processed_tokens()));
 }
 
 void CacheStoreTier::select_namespaces(RequestState& state, const PromptCachePolicy& policy) {

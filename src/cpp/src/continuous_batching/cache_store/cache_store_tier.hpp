@@ -276,8 +276,8 @@ private:
     /// when the provider cannot open it (@p error says why).
     const OpenNamespace* session_namespace(const std::string& scope, std::string& error);
 
-    /// Logs, at info level, a request's prompt length, the tokens the device cache and the store supplied, and the
-    /// processed-token count it starts computing from. Called once that count is final.
+    /// Logs a request's prompt length, the tokens the device cache and the store supplied, and the processed-token
+    /// count it starts computing from, as an info line printed whatever the log level. Called once that count is final.
     static void log_cache_hits(const SequenceGroup& group);
 
     /// Sets the request's read and write namespaces from its policy's scope; opens a session namespace on first use.
