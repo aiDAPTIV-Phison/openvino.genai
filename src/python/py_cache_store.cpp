@@ -43,7 +43,8 @@ auto cache_store_config_docstring = R"(
                                block's identity, not the integrity of its bytes).
     :param step_transfer_budget_bytes: bytes copied between device cache and staging for store writes per step, for
                                        a provider with asynchronous I/O (a synchronous one blocks until written).
-    :param write: engine-level write policy, write.device_to_store.trigger and write.host_to_store.trigger.
+    :param write: engine-level write policy, write.device_to_store.trigger and write.host_to_store.trigger
+                  (default WriteTrigger.Immediate).
     :param properties: provider settings as a dict of strings; assign a whole dict, items of the returned copy cannot
                        be changed in place.
 )";

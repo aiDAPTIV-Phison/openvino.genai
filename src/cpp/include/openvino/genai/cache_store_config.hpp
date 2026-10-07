@@ -71,7 +71,8 @@ struct CacheStoreConfig {
 
     /** @brief Write policy of one tier-to-tier movement. */
     struct MovementPolicy {
-        WriteTrigger trigger = WriteTrigger::OnEvict;
+        /** Immediate by default: a block is in the store as soon as it is complete. */
+        WriteTrigger trigger = WriteTrigger::Immediate;
 
         bool operator==(const MovementPolicy& other) const {
             return trigger == other.trigger;
