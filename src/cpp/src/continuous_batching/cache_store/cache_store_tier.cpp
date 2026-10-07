@@ -91,7 +91,7 @@ std::unique_ptr<CacheStoreTier> CacheStoreTier::create(const SchedulerConfig& co
     std::shared_ptr<StoreProvider> provider = StoreProvider::create(store_config, error);
     if (!provider) {
         GENAI_WARN("The cache store is disabled: provider '" + store_config.provider + "' from " +
-                   store_config.library_path + " cannot be used: " + error + ".");
+                   StoreProvider::library_path_of(store_config) + " cannot be used: " + error + ".");
         return nullptr;
     }
     std::unique_ptr<CacheStoreTier> tier(

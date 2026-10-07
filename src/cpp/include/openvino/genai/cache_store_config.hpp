@@ -98,7 +98,10 @@ struct CacheStoreConfig {
     std::uint64_t capacity_bytes = 0;
     /** Provider to select from the loaded module, e.g. "vendor-x"; empty selects the module's first one. */
     std::string provider;
-    /** Path of the store plugin library. Required. */
+    /**
+     * Path of the store plugin library. When empty, the library named after the provider is loaded from the folder of
+     * the GenAI library: `kvcache_<provider>.dll` (`libkvcache_<provider>.so` / `.dylib` elsewhere).
+     */
     std::string library_path;
     /** Size of the host staging pool every store transfer goes through. */
     std::size_t staging_bytes = 32 * 1024 * 1024;
@@ -133,8 +136,9 @@ struct CacheStoreConfig {
         OPENVINO_ASSERT(staging_bytes > 0, "CacheStoreConfig staging_bytes must be greater than 0");
         OPENVINO_ASSERT(step_transfer_budget_bytes > 0,
                         "CacheStoreConfig step_transfer_budget_bytes must be greater than 0");
-        OPENVINO_ASSERT(!library_path.empty(),
-                        "CacheStoreConfig library_path is required: the store provider is a plugin library");
+        OPENVINO_ASSERT(!library_path.empty() || !provider.empty(),
+                        "CacheStoreConfig needs a library_path or a provider: the store provider is a plugin library, "
+                        "found by its path or by the provider's name next to the GenAI library");
     }
 
     bool operator==(const CacheStoreConfig& other) const {

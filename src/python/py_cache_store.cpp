@@ -34,7 +34,8 @@ auto cache_store_config_docstring = R"(
     :param directory: location passed to the provider's open.
     :param capacity_bytes: capacity budget passed to the provider's open; 0 lets the provider decide.
     :param provider: provider name to select from the module; empty selects the first one.
-    :param library_path: path of the plugin library; required.
+    :param library_path: path of the plugin library; when empty, the library named after the provider
+                         (kvcache_<provider>.dll, libkvcache_<provider>.so) is loaded from the GenAI library's folder.
     :param staging_bytes: size of the host staging pool every store transfer goes through.
     :param io_threads: number of host I/O threads calling the provider.
     :param durability: CacheStoreConfig.Durability.Relaxed or Strict.

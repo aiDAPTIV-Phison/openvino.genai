@@ -86,10 +86,17 @@ private:
 class StoreProvider {
 public:
     /**
-     * @brief Loads `config.library_path`, checks the handshake and selects `config.provider`. Never throws for a plugin
-     * problem. @return The provider, or nullptr when anything fails; @p error then receives the reason.
+     * @brief Loads the plugin library (see library_path_of), checks the handshake and selects `config.provider`. Never
+     * throws for a plugin problem. @return The provider, or nullptr when anything fails; @p error then receives the
+     * reason.
      */
     static std::shared_ptr<StoreProvider> create(const CacheStoreConfig& config, std::string& error);
+
+    /**
+     * @return `config.library_path`, or when that is empty the library named after `config.provider` in the folder of
+     * the GenAI library.
+     */
+    static std::string library_path_of(const CacheStoreConfig& config);
 
     const std::string& name() const {
         return m_name;

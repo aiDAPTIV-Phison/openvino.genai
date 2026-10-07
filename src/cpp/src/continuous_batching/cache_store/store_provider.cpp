@@ -12,6 +12,7 @@
 
 #include "gguf_utils/gguf_tokenizer.hpp"
 #include "logger.hpp"
+#include "tokenizer/tokenizers_path.hpp"
 #include "openvino/genai/cache_store/sdk_fingerprint.h"
 
 namespace ov::genai::cache_store {
@@ -248,10 +249,26 @@ StoreProvider::StoreProvider(const OvKVCacheStoreProviderDescriptor* descriptor,
       m_origin(std::move(origin)),
       m_capabilities(descriptor->capabilities) {}
 
+std::string StoreProvider::library_path_of(const CacheStoreConfig& config) {
+    if (!config.library_path.empty()) {
+        return config.library_path;
+    }
+#ifdef _WIN32
+    const std::string file_name = "kvcache_" + config.provider + ".dll";
+#elif defined(__APPLE__)
+    const std::string file_name = "libkvcache_" + config.provider + ".dylib";
+#else
+    const std::string file_name = "libkvcache_" + config.provider + ".so";
+#endif
+    // the tokenizers library sits next to the GenAI library
+    return (tokenizers_relative_to_genai().parent_path() / file_name).string();
+}
+
 std::shared_ptr<StoreProvider> StoreProvider::create(const CacheStoreConfig& config, std::string& error) {
     error.clear();
+    const std::string library_path = library_path_of(config);
     try {
-        std::shared_ptr<void> library = load_module_library(config.library_path);
+        std::shared_ptr<void> library = load_module_library(library_path);
         const auto entry = reinterpret_cast<EntryFunction>(get_symbol(library, OV_KVCACHE_STORE_ENTRY_SYMBOL));
         const OvKVCacheStoreModuleInfo* info = entry();
         error = check_module(info);
@@ -270,7 +287,7 @@ std::shared_ptr<StoreProvider> StoreProvider::create(const CacheStoreConfig& con
                 error = check_provider(selected);
                 if (error.empty()) {
                     return std::shared_ptr<StoreProvider>(
-                        new StoreProvider(selected, descriptor_name(*selected), config.library_path));
+                        new StoreProvider(selected, descriptor_name(*selected), library_path));
                 }
             }
         }
