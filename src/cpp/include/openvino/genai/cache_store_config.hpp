@@ -119,6 +119,7 @@ struct CacheStoreConfig {
     /**
      * Bytes copied between the device cache and staging for store writes in one pipeline step, for a provider with
      * asynchronous I/O. A synchronous provider is written in full when the blocks are due.
+     * 0: nothing is copied during the steps of a request; its blocks are written when it ends, after its last token.
      */
     std::size_t step_transfer_budget_bytes = 16 * 1024 * 1024;
     WritePolicy write;
@@ -134,8 +135,6 @@ struct CacheStoreConfig {
                         "against the tokens their key was derived from");
         OPENVINO_ASSERT(io_threads > 0, "CacheStoreConfig io_threads must be greater than 0");
         OPENVINO_ASSERT(staging_bytes > 0, "CacheStoreConfig staging_bytes must be greater than 0");
-        OPENVINO_ASSERT(step_transfer_budget_bytes > 0,
-                        "CacheStoreConfig step_transfer_budget_bytes must be greater than 0");
         OPENVINO_ASSERT(!library_path.empty() || !provider.empty(),
                         "CacheStoreConfig needs a library_path or a provider: the store provider is a plugin library, "
                         "found by its path or by the provider's name next to the GenAI library");

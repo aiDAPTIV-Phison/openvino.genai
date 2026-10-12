@@ -944,12 +944,26 @@ void CacheStoreTier::after_step(const std::vector<SequenceGroup::Ptr>& requests,
         if (!state) {
             continue;
         }
+        if (m_config.step_transfer_budget_bytes == 0 && state->write_namespace &&
+            state->write_namespace->store->is_async()) {
+            continue;  // written when the request ends (on_free_sequence)
+        }
         if (state->write_mode == WriteMode::Immediate || state->write_mode == WriteMode::Push) {
             write_complete_blocks(*state, true);
         } else if (state->write_mode == WriteMode::OnAccess) {
             write_reused_blocks(*state, true);
         }
     }
+}
+
+bool CacheStoreTier::is_last_sequence_of_ended_request(std::uint64_t seq_id) {
+    std::lock_guard<std::mutex> lock(m_requests_mutex);
+    const auto it = m_requests.find(seq_id);
+    if (it == m_requests.end()) {
+        return false;
+    }
+    const SequenceGroup& group = *it->second->group;
+    return group.has_finished() || group.handle_stopped() || group.handle_cancelled();
 }
 
 void CacheStoreTier::on_free_sequence(std::uint64_t seq_id) {

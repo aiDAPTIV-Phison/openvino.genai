@@ -85,6 +85,10 @@ public:
     /// for write-back when the device cache evicts them; then forgets the sequence.
     void on_free_sequence(std::uint64_t seq_id);
 
+    /// Whether @p seq_id is the sequence of a request the tier follows and that request has ended. The pipeline then
+    /// frees the sequence with its request, so what is written at the end does not delay the request's result.
+    bool is_last_sequence_of_ended_request(std::uint64_t seq_id);
+
     /// Allocation evicts a cached block: an `on_evict` block is queued for write-back.
     void on_overwrite(CacheType type, uint64_t hash, size_t block_index) override;
 

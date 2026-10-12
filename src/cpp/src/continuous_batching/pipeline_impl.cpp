@@ -720,6 +720,11 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
 
         for (auto seq_id : sampler_output.m_dropped_sequences) {
             if (m_cache_store) {
+                if (m_cache_store->is_last_sequence_of_ended_request(seq_id)) {
+                    // stored and freed with its request (_free_non_running_requests), after the request's result is
+                    // available
+                    continue;
+                }
                 m_cache_store->on_free_sequence(seq_id);
             }
             m_scheduler->free_sequence(seq_id);
@@ -999,15 +1004,16 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_free_non_running_reque
     while (requests_iterator != m_requests.end()) {
         const auto& request = *requests_iterator;
         if (request->has_finished() || request->handle_stopped() || request->handle_cancelled()) {
-            // before the metrics are taken, so they include what the store writes when the request ends
+            auto perf_metrics = request->get_perf_metrics();
+            perf_metrics.load_time = m_load_time_ms;
+            request->get_generation_stream()->set_perf_metrics(std::move(perf_metrics));
+            // After the request's result is available to its caller, and while the sequences still own their blocks:
+            // what the store writes when a request ends does not delay the request
             if (m_cache_store) {
                 for (const auto& sequence : request->get_sequences()) {
                     m_cache_store->on_free_sequence(sequence->get_id());
                 }
             }
-            auto perf_metrics = request->get_perf_metrics();
-            perf_metrics.load_time = m_load_time_ms;
-            request->get_generation_stream()->set_perf_metrics(std::move(perf_metrics));
             for (const auto& sequence : request->get_sequences()) {
                 if (m_scheduler->has_block_table(sequence->get_id())) {
                     m_scheduler->free_sequence(sequence->get_id());
