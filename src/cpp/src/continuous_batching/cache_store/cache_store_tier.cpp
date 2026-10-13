@@ -944,8 +944,7 @@ void CacheStoreTier::after_step(const std::vector<SequenceGroup::Ptr>& requests,
         if (!state) {
             continue;
         }
-        if (m_config.step_transfer_budget_bytes == 0 && state->write_namespace &&
-            state->write_namespace->store->is_async()) {
+        if (m_config.step_transfer_budget_bytes == 0) {
             continue;  // written when the request ends (on_free_sequence)
         }
         if (state->write_mode == WriteMode::Immediate || state->write_mode == WriteMode::Push) {
@@ -1087,7 +1086,7 @@ std::size_t CacheStoreTier::write_blocks(RequestState& state,
         return first_block;
     }
     const bool synchronous = !state.write_namespace->store->is_async();
-    const bool budgeted = within_budget && !synchronous;
+    const bool budgeted = within_budget;
     std::size_t next = first_block;
     while (next < end_block) {
         const std::uint64_t seen = m_staging.release_count();

@@ -42,8 +42,8 @@ auto cache_store_config_docstring = R"(
     :param verify_key_tokens: verify blocks read back against their tokens; must stay True.
     :param verify_payload_crc: also store and verify a checksum of every block (default True: the witness proves the
                                block's identity, not the integrity of its bytes).
-    :param step_transfer_budget_bytes: bytes copied between device cache and staging for store writes per step, for
-                                       a provider with asynchronous I/O (a synchronous one blocks until written).
+    :param step_transfer_budget_bytes: bytes copied between device cache and staging for store writes per step (a
+                                       synchronous provider writes them before the next step starts).
                                        0: a request's blocks are written when it ends, after its last token.
     :param write: engine-level write policy, write.device_to_store.trigger and write.host_to_store.trigger
                   (default WriteTrigger.Immediate).

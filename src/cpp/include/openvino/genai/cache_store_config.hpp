@@ -117,8 +117,8 @@ struct CacheStoreConfig {
      */
     bool verify_payload_crc = true;
     /**
-     * Bytes copied between the device cache and staging for store writes in one pipeline step, for a provider with
-     * asynchronous I/O. A synchronous provider is written in full when the blocks are due.
+     * Bytes copied between the device cache and staging for store writes in one pipeline step. A provider with
+     * asynchronous I/O writes them in the background; a synchronous one writes them before the next step starts.
      * 0: nothing is copied during the steps of a request; its blocks are written when it ends, after its last token.
      */
     std::size_t step_transfer_budget_bytes = 16 * 1024 * 1024;
